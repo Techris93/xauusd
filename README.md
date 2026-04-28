@@ -45,6 +45,7 @@ Recommended:
 Compatibility note:
 
 - `PREDICTION_REFRESH_MINUTES` is still accepted as a legacy alias, but it is now interpreted in seconds.
+- The previous `gold-predictor` names are also accepted: `VAPID_CLAIMS_SUBJECT`, `VAPID_PUBLIC_KEY`, and `VAPID_PRIVATE_KEY`.
 
 ## Background Push Alerts
 
@@ -52,10 +53,11 @@ The dashboard now supports true Web Push alerts for important signal changes.
 
 - Open the dashboard once and click `Enable Push Alerts`.
 - After the browser grants permission, the server stores a device subscription and can push alerts even when the page is closed.
-- If `WEB_PUSH_VAPID_*` is not set, the app generates runtime keys automatically. That is enough to get started, but subscriptions may need to be re-enabled after a redeploy.
+- If stable VAPID keys are not set, the app generates runtime keys automatically. That is enough to get started, but subscriptions may need to be re-enabled after a redeploy.
 - Push subscriptions are accepted only for HTTPS push-service endpoints, and runtime push key/subscription files are written with owner-only permissions.
 - Background pushes are sent only when the server detects an important signal change. They are not sent on every 5-second refresh.
 - The prediction scheduler runs inside the web service process. If your host sleeps inactive web services, the scheduler cannot poll Twelve Data or send push alerts until the service wakes up again.
+- On Render, CPU keeps the service running but does not make runtime files durable. If the service redeploys or restarts, saved device subscriptions can disappear unless `WEB_PUSH_SUBSCRIPTIONS_PATH` points at a mounted persistent disk path.
 
 Browser note:
 
@@ -75,6 +77,14 @@ For stable production push alerts, also set:
 export WEB_PUSH_SUBJECT=mailto:alerts@example.com
 export WEB_PUSH_VAPID_PUBLIC_KEY=your_public_vapid_key
 export WEB_PUSH_VAPID_PRIVATE_KEY=your_private_vapid_key
+```
+
+The legacy `gold-predictor` names also work:
+
+```bash
+export VAPID_CLAIMS_SUBJECT=mailto:alerts@example.com
+export VAPID_PUBLIC_KEY=your_public_vapid_key
+export VAPID_PRIVATE_KEY=your_private_vapid_key
 ```
 
 If the public VAPID key is omitted or does not match the private key, the app derives the public key from the private key so browser subscriptions and server pushes stay paired.

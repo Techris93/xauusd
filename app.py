@@ -53,19 +53,46 @@ def _read_prediction_refresh_seconds():
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
+
+def _first_env_value(*names, default=""):
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return default
+
+
+def _runtime_path(env_name, filename):
+    configured_path = _first_env_value(env_name)
+    if not configured_path:
+        return os.path.join(BASE_DIR, filename)
+    if os.path.isabs(configured_path):
+        return configured_path
+    return os.path.join(BASE_DIR, configured_path)
+
+
+def _web_push_subject():
+    return _first_env_value(
+        "WEB_PUSH_SUBJECT",
+        "VAPID_CLAIMS_SUBJECT",
+        default="mailto:notifications@xauusd.local",
+    )
+
 TD_OUTPUT_TIMEZONE = "UTC"
 DEFAULT_SYMBOL = os.getenv("TWELVE_DATA_SYMBOL", "XAU/USD").strip() or "XAU/USD"
 DEFAULT_PERIOD = os.getenv("PREDICTOR_PERIOD", "5d").strip() or "5d"
 DEFAULT_INTERVAL = os.getenv("PREDICTOR_INTERVAL", "1h").strip() or "1h"
 REFRESH_SECONDS = _read_prediction_refresh_seconds()
 MAX_PREDICTION_STALENESS = timedelta(seconds=max(REFRESH_SECONDS * 4, 20))
-WEB_PUSH_SUBJECT = (
-    os.getenv("WEB_PUSH_SUBJECT", "mailto:notifications@xauusd.local").strip()
-    or "mailto:notifications@xauusd.local"
+WEB_PUSH_SUBSCRIPTIONS_PATH = _runtime_path(
+    "WEB_PUSH_SUBSCRIPTIONS_PATH",
+    "runtime_webpush_subscriptions.json",
 )
-WEB_PUSH_SUBSCRIPTIONS_PATH = os.path.join(BASE_DIR, "runtime_webpush_subscriptions.json")
-WEB_PUSH_VAPID_PATH = os.path.join(BASE_DIR, "runtime_webpush_vapid.json")
-WEB_PUSH_VAPID_PEM_PATH = os.path.join(BASE_DIR, "runtime_webpush_vapid_private.pem")
+WEB_PUSH_VAPID_PATH = _runtime_path("WEB_PUSH_VAPID_PATH", "runtime_webpush_vapid.json")
+WEB_PUSH_VAPID_PEM_PATH = _runtime_path(
+    "WEB_PUSH_VAPID_PEM_PATH",
+    "runtime_webpush_vapid_private.pem",
+)
 MAX_NOTIFICATION_PAYLOAD_BYTES = 64 * 1024
 MAX_PUSH_ENDPOINT_BYTES = 2048
 MAX_PUSH_KEY_BYTES = 512
@@ -117,6 +144,9 @@ def _read_json_file(path, default):
 
 
 def _write_json_file(path, payload, mode=None):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
     with open(path, "w", encoding="utf-8") as file_handle:
         json.dump(payload, file_handle, indent=2)
     if mode is not None:
@@ -147,6 +177,9 @@ def _write_vapid_pem(private_key_b64):
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
     )
+    directory = os.path.dirname(WEB_PUSH_VAPID_PEM_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
     with open(WEB_PUSH_VAPID_PEM_PATH, "wb") as file_handle:
         file_handle.write(pem_bytes)
     os.chmod(WEB_PUSH_VAPID_PEM_PATH, 0o600)
@@ -159,7 +192,7 @@ def _generate_runtime_vapid_keys():
     payload = {
         "privateKey": _urlsafe_b64encode(raw_private_key),
         "publicKey": _public_key_from_private_key(private_key),
-        "subject": WEB_PUSH_SUBJECT,
+        "subject": _web_push_subject(),
         "source": "runtime",
     }
     _write_json_file(WEB_PUSH_VAPID_PATH, payload, mode=0o600)
@@ -167,20 +200,21 @@ def _generate_runtime_vapid_keys():
 
 
 def _ensure_web_push_keys():
-    env_private_key = os.getenv("WEB_PUSH_VAPID_PRIVATE_KEY", "").strip()
-    env_public_key = os.getenv("WEB_PUSH_VAPID_PUBLIC_KEY", "").strip()
+    env_private_key = _first_env_value("WEB_PUSH_VAPID_PRIVATE_KEY", "VAPID_PRIVATE_KEY")
+    env_public_key = _first_env_value("WEB_PUSH_VAPID_PUBLIC_KEY", "VAPID_PUBLIC_KEY")
+    subject = _web_push_subject()
     if env_private_key:
         private_key = _build_vapid_private_key(env_private_key)
         derived_public_key = _public_key_from_private_key(private_key)
         if env_public_key and env_public_key != derived_public_key:
             logger.warning(
-                "WEB_PUSH_VAPID_PUBLIC_KEY does not match WEB_PUSH_VAPID_PRIVATE_KEY; "
+                "Configured VAPID public key does not match the private key; "
                 "using the derived public key."
             )
         payload = {
             "privateKey": env_private_key,
             "publicKey": derived_public_key,
-            "subject": WEB_PUSH_SUBJECT,
+            "subject": subject,
             "source": "env",
         }
         _write_vapid_pem(payload["privateKey"])
@@ -190,7 +224,7 @@ def _ensure_web_push_keys():
     if not isinstance(payload, dict) or not payload.get("privateKey") or not payload.get("publicKey"):
         payload = _generate_runtime_vapid_keys()
     else:
-        payload["subject"] = WEB_PUSH_SUBJECT
+        payload["subject"] = subject
 
     _write_vapid_pem(payload["privateKey"])
     return payload
@@ -219,14 +253,14 @@ def get_web_push_config():
     if payload.get("source") != "env":
         warning = (
             "Server-generated push keys are active. Background alerts stay working after you subscribe, "
-            "but stable WEB_PUSH_VAPID_* environment variables are recommended so subscriptions survive redeploys."
+            "but stable VAPID environment variables are recommended so subscriptions survive redeploys."
         )
 
     return {
         "available": True,
         "workerPath": "/notification-sw.js",
         "vapidPublicKey": payload["publicKey"],
-        "subject": payload.get("subject") or WEB_PUSH_SUBJECT,
+        "subject": payload.get("subject") or _web_push_subject(),
         "privateKeyPath": WEB_PUSH_VAPID_PEM_PATH,
         "warning": warning,
     }
@@ -388,6 +422,36 @@ def _describe_server_signal_change(previous_snapshot, current_snapshot):
     }
 
 
+def _web_push_error_text(exc):
+    response = getattr(exc, "response", None)
+    if response is None:
+        return str(exc)
+
+    text = getattr(response, "text", None)
+    if text:
+        return str(text)
+
+    content = getattr(response, "content", None)
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="replace")
+    if content:
+        return str(content)
+
+    return str(exc)
+
+
+def _is_stale_push_failure(exc):
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code in {404, 410}:
+        return True
+    if status_code != 403:
+        return False
+
+    normalized_text = re.sub(r"[^a-z0-9]+", "", _web_push_error_text(exc).lower())
+    return "badjwttoken" in normalized_text
+
+
 def _send_web_push_notification(title, body, severity):
     subscriptions = _load_push_subscriptions()
     if not subscriptions:
@@ -419,9 +483,8 @@ def _send_web_push_notification(title, body, severity):
                 ttl=300,
             )
         except WebPushException as exc:
-            status_code = getattr(getattr(exc, "response", None), "status_code", None)
             logger.warning("Web push failed for %s: %s", endpoint, exc)
-            if status_code in {404, 410}:
+            if _is_stale_push_failure(exc):
                 stale_endpoints.append(endpoint)
         except Exception as exc:
             logger.warning("Unexpected web push failure for %s: %s", endpoint, exc)

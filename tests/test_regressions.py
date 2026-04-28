@@ -31,6 +31,7 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.last_update = None
         app_module.error_state = None
         app_module.last_push_snapshot = None
+        app_module.get_web_push_config.cache_clear()
         self.client = app_module.app.test_client()
 
     def tearDown(self):
@@ -38,6 +39,7 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.last_update = None
         app_module.error_state = None
         app_module.last_push_snapshot = None
+        app_module.get_web_push_config.cache_clear()
 
     @staticmethod
     def build_frame(index=None, volume=1000.0):
@@ -314,6 +316,44 @@ class PredictorRegressionTests(unittest.TestCase):
 
             self.assertEqual(payload["publicKey"], expected_public_key)
             self.assertEqual(Path(pem_path).stat().st_mode & 0o777, 0o600)
+
+    def test_web_push_config_accepts_legacy_vapid_env_names(self):
+        private_key = app_module.ec.generate_private_key(app_module.ec.SECP256R1())
+        private_key_b64 = app_module._urlsafe_b64encode(
+            private_key.private_numbers().private_value.to_bytes(32, "big")
+        )
+        expected_public_key = app_module._public_key_from_private_key(private_key)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pem_path = str(Path(temp_dir) / "vapid_private.pem")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "WEB_PUSH_SUBJECT": "",
+                    "WEB_PUSH_VAPID_PRIVATE_KEY": "",
+                    "WEB_PUSH_VAPID_PUBLIC_KEY": "",
+                    "VAPID_CLAIMS_SUBJECT": "mailto:legacy@example.com",
+                    "VAPID_PRIVATE_KEY": private_key_b64,
+                    "VAPID_PUBLIC_KEY": expected_public_key,
+                },
+                clear=False,
+            ):
+                with mock.patch.object(app_module, "WEB_PUSH_VAPID_PEM_PATH", pem_path):
+                    payload = app_module._ensure_web_push_keys()
+
+            self.assertEqual(payload["source"], "env")
+            self.assertEqual(payload["publicKey"], expected_public_key)
+            self.assertEqual(payload["subject"], "mailto:legacy@example.com")
+
+    def test_bad_jwt_push_failure_is_treated_as_stale_subscription(self):
+        class Response:
+            status_code = 403
+            text = '{"reason": "Bad JwtToken"}'
+
+        exc = Exception("Push failed")
+        exc.response = Response()
+
+        self.assertTrue(app_module._is_stale_push_failure(exc))
 
     def test_notification_subscription_routes_roundtrip(self):
         sample_subscription = {
