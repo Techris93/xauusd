@@ -75,7 +75,6 @@ latest_prediction = None
 last_update = None
 error_state = None
 last_push_snapshot = None
-last_push_result = None
 prediction_refresh_lock = threading.RLock()
 push_lock = threading.Lock()
 
@@ -389,71 +388,28 @@ def _describe_server_signal_change(previous_snapshot, current_snapshot):
     }
 
 
-def _scheduler_diagnostics():
-    return {
-        "running": bool(scheduler and scheduler.running),
-        "refreshSeconds": REFRESH_SECONDS,
-    }
-
-
-def _record_push_result(result):
-    global last_push_result
-
-    last_push_result = {
-        **result,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def _send_web_push_notification(
-    title,
-    body,
-    severity,
-    tag="xauusd-important-signal",
-    show_when_visible=False,
-    target_endpoint=None,
-):
-    all_subscriptions = _load_push_subscriptions()
-    subscriptions = [
-        subscription
-        for subscription in all_subscriptions
-        if target_endpoint is None or subscription.get("endpoint") == target_endpoint
-    ]
-    result = {
-        "subscriberCount": len(all_subscriptions),
-        "targeted": bool(target_endpoint),
-        "attempted": 0,
-        "sent": 0,
-        "failed": 0,
-        "stale": 0,
-        "lastError": None,
-    }
+def _send_web_push_notification(title, body, severity):
+    subscriptions = _load_push_subscriptions()
     if not subscriptions:
-        result["lastError"] = "No matching push subscriptions."
-        _record_push_result(result)
-        return result
+        return
 
     config = get_web_push_config()
     if not config.get("available") or webpush is None:
-        result["lastError"] = config.get("warning") or "Web push is unavailable."
-        _record_push_result(result)
-        return result
+        return
 
     payload = json.dumps(
         {
             "title": title,
             "body": body,
             "url": "/",
-            "tag": tag,
+            "tag": "xauusd-important-signal",
             "requireInteraction": severity == "success",
-            "showWhenVisible": show_when_visible,
         }
     )
     stale_endpoints = []
 
     for subscription in subscriptions:
         endpoint = subscription.get("endpoint")
-        result["attempted"] += 1
         try:
             webpush(
                 subscription_info=subscription,
@@ -462,25 +418,16 @@ def _send_web_push_notification(
                 vapid_claims={"sub": config["subject"]},
                 ttl=300,
             )
-            result["sent"] += 1
         except WebPushException as exc:
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
             logger.warning("Web push failed for %s: %s", endpoint, exc)
-            result["failed"] += 1
-            result["lastError"] = str(exc)
             if status_code in {404, 410}:
-                result["stale"] += 1
                 stale_endpoints.append(endpoint)
         except Exception as exc:
             logger.warning("Unexpected web push failure for %s: %s", endpoint, exc)
-            result["failed"] += 1
-            result["lastError"] = str(exc)
 
     for endpoint in stale_endpoints:
         _remove_push_subscription(endpoint)
-
-    _record_push_result(result)
-    return result
 
 
 def _notify_signal_change(prediction):
@@ -757,8 +704,6 @@ def notification_config():
                 "workerPath": config.get("workerPath", "/notification-sw.js"),
                 "warning": config.get("warning"),
                 "subscriberCount": len(_load_push_subscriptions()),
-                "scheduler": _scheduler_diagnostics(),
-                "lastPushResult": last_push_result,
             }
         )
     )
@@ -791,34 +736,6 @@ def notification_unsubscribe():
     endpoint = payload.get("endpoint") or (payload.get("subscription") or {}).get("endpoint")
     subscriber_count = _remove_push_subscription(endpoint)
     return jsonify({"ok": True, "subscriberCount": subscriber_count})
-
-
-@app.route("/api/notifications/test", methods=["POST"])
-def notification_test():
-    config = get_web_push_config()
-    if not config.get("available"):
-        return jsonify({"ok": False, "error": config.get("warning") or "Web push is unavailable."}), 503
-    if request.content_length and request.content_length > MAX_NOTIFICATION_PAYLOAD_BYTES:
-        return jsonify({"ok": False, "error": "Notification payload is too large."}), 413
-
-    payload = request.get_json(silent=True) or {}
-    endpoint = str(payload.get("endpoint") or (payload.get("subscription") or {}).get("endpoint") or "").strip()
-    if not endpoint:
-        return jsonify({"ok": False, "error": "A push subscription endpoint is required."}), 400
-
-    result = _send_web_push_notification(
-        "XAU/USD test push",
-        "Push delivery is working for this device.",
-        "info",
-        tag="xauusd-test-push",
-        show_when_visible=True,
-        target_endpoint=endpoint,
-    )
-    if result["sent"] > 0:
-        return jsonify({"ok": True, "result": result})
-    if result["attempted"] == 0:
-        return jsonify({"ok": False, "error": result["lastError"], "result": result}), 404
-    return jsonify({"ok": False, "error": result["lastError"] or "Push delivery failed.", "result": result}), 502
 
 @app.route("/")
 def dashboard():

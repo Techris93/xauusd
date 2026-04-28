@@ -31,7 +31,6 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.last_update = None
         app_module.error_state = None
         app_module.last_push_snapshot = None
-        app_module.last_push_result = None
         self.client = app_module.app.test_client()
 
     def tearDown(self):
@@ -39,7 +38,6 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.last_update = None
         app_module.error_state = None
         app_module.last_push_snapshot = None
-        app_module.last_push_result = None
 
     @staticmethod
     def build_frame(index=None, volume=1000.0):
@@ -286,10 +284,13 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("pushAvailable", payload)
         self.assertEqual(payload.get("workerPath"), "/notification-sw.js")
-        self.assertIn("scheduler", payload)
-        self.assertIn("lastPushResult", payload)
         if payload.get("pushAvailable"):
             self.assertTrue(payload.get("vapidPublicKey"))
+
+    def test_notification_test_route_is_not_exposed(self):
+        response = self.client.post("/api/notifications/test", json={})
+
+        self.assertEqual(response.status_code, 404)
 
     def test_web_push_config_derives_public_key_when_env_key_is_mismatched(self):
         private_key = app_module.ec.generate_private_key(app_module.ec.SECP256R1())
@@ -402,86 +403,6 @@ class PredictorRegressionTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertFalse(Path(subscriptions_path).exists())
-
-    def test_notification_test_route_sends_to_requesting_subscription(self):
-        sample_subscription = {
-            "endpoint": "https://example.com/subscriptions/device-1",
-            "expirationTime": None,
-            "keys": {
-                "p256dh": "sample-p256dh-key",
-                "auth": "sample-auth-key",
-            },
-        }
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            subscriptions_path = str(Path(temp_dir) / "push_subscriptions.json")
-            private_key_path = str(Path(temp_dir) / "test-private.pem")
-            push_config = {
-                "available": True,
-                "workerPath": "/notification-sw.js",
-                "vapidPublicKey": "sample-public-key",
-                "subject": "mailto:test@example.com",
-                "privateKeyPath": private_key_path,
-            }
-            app_module._write_json_file(
-                subscriptions_path,
-                [sample_subscription],
-            )
-
-            with mock.patch.object(
-                app_module,
-                "WEB_PUSH_SUBSCRIPTIONS_PATH",
-                subscriptions_path,
-            ):
-                with mock.patch.object(
-                    app_module,
-                    "get_web_push_config",
-                    return_value=push_config,
-                ):
-                    with mock.patch.object(app_module, "webpush") as mocked_webpush:
-                        response = self.client.post(
-                            "/api/notifications/test",
-                            json={"endpoint": sample_subscription["endpoint"]},
-                        )
-
-        payload = response.get_json()
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(payload.get("ok"))
-        self.assertEqual(payload.get("result", {}).get("sent"), 1)
-        mocked_webpush.assert_called_once()
-        self.assertIsNotNone(app_module.last_push_result)
-        self.assertEqual(app_module.last_push_result.get("sent"), 1)
-
-    def test_notification_test_route_rejects_unknown_subscription(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            subscriptions_path = str(Path(temp_dir) / "push_subscriptions.json")
-            push_config = {
-                "available": True,
-                "workerPath": "/notification-sw.js",
-                "vapidPublicKey": "sample-public-key",
-                "subject": "mailto:test@example.com",
-                "privateKeyPath": str(Path(temp_dir) / "test-private.pem"),
-            }
-            app_module._write_json_file(subscriptions_path, [])
-
-            with mock.patch.object(
-                app_module,
-                "WEB_PUSH_SUBSCRIPTIONS_PATH",
-                subscriptions_path,
-            ):
-                with mock.patch.object(
-                    app_module,
-                    "get_web_push_config",
-                    return_value=push_config,
-                ):
-                    response = self.client.post(
-                        "/api/notifications/test",
-                        json={"endpoint": "https://example.com/subscriptions/missing"},
-                    )
-
-        payload = response.get_json()
-        self.assertEqual(response.status_code, 404)
-        self.assertFalse(payload.get("ok"))
 
     def test_health_endpoint_reports_healthy_after_prediction(self):
         frame = self.build_frame(volume=0.0)

@@ -508,14 +508,6 @@
           >
             Enable Alerts
           </button>
-          <button
-            id="notificationTest"
-            class="notification-btn"
-            type="button"
-            hidden
-          >
-            Test Push
-          </button>
           <div id="notificationState" class="notification-state">
             Choose how this device receives signal alerts.
           </div>
@@ -848,6 +840,54 @@
         return Uint8Array.from(rawData, (character) => character.charCodeAt(0));
       }
 
+      function byteArraysEqual(first, second) {
+        if (!first || !second || first.length !== second.length) {
+          return false;
+        }
+
+        for (let index = 0; index < first.length; index += 1) {
+          if (first[index] !== second[index]) {
+            return false;
+          }
+        }
+
+        return true;
+      }
+
+      function subscriptionUsesCurrentVapidKey(subscription) {
+        if (
+          !subscription ||
+          !pushConfig ||
+          !pushConfig.vapidPublicKey ||
+          !subscription.options ||
+          !subscription.options.applicationServerKey
+        ) {
+          return true;
+        }
+
+        const expectedKey = urlBase64ToUint8Array(pushConfig.vapidPublicKey);
+        const subscriptionKey = new Uint8Array(
+          subscription.options.applicationServerKey,
+        );
+        return byteArraysEqual(subscriptionKey, expectedKey);
+      }
+
+      async function getCurrentPushSubscription(registration) {
+        const subscription = await registration.pushManager.getSubscription();
+        if (!subscription || subscriptionUsesCurrentVapidKey(subscription)) {
+          return subscription;
+        }
+
+        const endpoint = subscription.endpoint;
+        try {
+          await subscription.unsubscribe();
+        } catch (error) {
+          console.error("Stale push unsubscribe failed:", error);
+        }
+        await removeSubscriptionFromServer(endpoint);
+        return null;
+      }
+
       async function fetchNotificationConfig() {
         try {
           const response = await fetch("/api/notifications/config");
@@ -873,7 +913,7 @@
 
         if (notificationWorkerRegistration) {
           pushSubscription =
-            await notificationWorkerRegistration.pushManager.getSubscription();
+            await getCurrentPushSubscription(notificationWorkerRegistration);
           return notificationWorkerRegistration;
         }
 
@@ -888,7 +928,7 @@
             (await navigator.serviceWorker.getRegistration("/")) ||
             notificationWorkerRegistration;
           pushSubscription =
-            await notificationWorkerRegistration.pushManager.getSubscription();
+            await getCurrentPushSubscription(notificationWorkerRegistration);
           notificationWorkerError = null;
         } catch (error) {
           notificationWorkerError = error;
@@ -927,43 +967,6 @@
         });
       }
 
-      async function sendTestPush() {
-        try {
-          if (!usingPushAlerts()) {
-            await ensurePushSubscription();
-            persistAlertPreference(true);
-          }
-
-          const endpoint = pushSubscription ? pushSubscription.endpoint : null;
-          if (!endpoint) {
-            throw new Error("This device does not have an active push subscription.");
-          }
-
-          const response = await fetch("/api/notifications/test", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ endpoint: endpoint }),
-          });
-          const payload = await response.json().catch(() => ({}));
-          if (!response.ok || !payload.ok) {
-            throw new Error(payload.error || "The test push could not be delivered.");
-          }
-
-          pushConfig = null;
-          await fetchNotificationConfig();
-          showToast("Test push sent to this device.", "success");
-        } catch (error) {
-          console.error("Test push failed:", error);
-          showToast(
-            error && error.message
-              ? error.message
-              : "The test push could not be delivered.",
-            "error",
-          );
-          updateNotificationControls();
-        }
-      }
-
       async function ensurePushSubscription() {
         if (
           !pushConfig ||
@@ -990,7 +993,7 @@
           );
         }
 
-        pushSubscription = await registration.pushManager.getSubscription();
+        pushSubscription = await getCurrentPushSubscription(registration);
         if (!pushSubscription) {
           pushSubscription = await registration.pushManager.subscribe({
             userVisibleOnly: true,
@@ -1079,14 +1082,10 @@
 
       function updateNotificationControls() {
         const button = document.getElementById("notificationToggle");
-        const testButton = document.getElementById("notificationTest");
         const state = document.getElementById("notificationState");
-        if (!button || !testButton || !state) {
+        if (!button || !state) {
           return;
         }
-
-        testButton.hidden = true;
-        testButton.disabled = true;
 
         const pushSupported = pushAlertsSupported();
         const pushAvailable = canUsePushAlerts();
@@ -1131,8 +1130,6 @@
         if (usingPushAlerts()) {
           button.className = "notification-btn enabled";
           button.textContent = "Pause Push Alerts";
-          testButton.hidden = false;
-          testButton.disabled = false;
           state.textContent =
             "Push alerts are active. Important signal changes can reach this device even after you close the page.";
           return;
@@ -1483,12 +1480,9 @@
       document
         .getElementById("notificationToggle")
         .addEventListener("click", toggleAlerts);
-      document
-        .getElementById("notificationTest")
-        .addEventListener("click", sendTestPush);
       bootstrapNotifications();
       fetchPrediction();
-      refreshInterval = setInterval(fetchPrediction, 30000);
+      refreshInterval = setInterval(fetchPrediction, 5000);
     </script>
   </body>
 </html>

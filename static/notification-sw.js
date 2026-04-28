@@ -40,7 +40,7 @@ self.addEventListener("push", (event) => {
         (client) => client.visibilityState === "visible" || client.focused,
       );
 
-      if (hasVisibleClient && !payload.showWhenVisible) {
+      if (hasVisibleClient) {
         return;
       }
 

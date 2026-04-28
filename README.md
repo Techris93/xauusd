@@ -52,7 +52,6 @@ The dashboard now supports true Web Push alerts for important signal changes.
 
 - Open the dashboard once and click `Enable Push Alerts`.
 - After the browser grants permission, the server stores a device subscription and can push alerts even when the page is closed.
-- Click `Test Push` after enabling alerts to verify that the saved subscription, server VAPID keys, browser service worker, and operating-system notifications are all working together.
 - If `WEB_PUSH_VAPID_*` is not set, the app generates runtime keys automatically. That is enough to get started, but subscriptions may need to be re-enabled after a redeploy.
 - Push subscriptions are accepted only for HTTPS push-service endpoints, and runtime push key/subscription files are written with owner-only permissions.
 - Background pushes are sent only when the server detects an important signal change. They are not sent on every 5-second refresh.
