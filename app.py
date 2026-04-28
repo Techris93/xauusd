@@ -185,6 +185,7 @@ def generate_prediction():
         prediction = compute_prediction(df, params=DEFAULT_PARAMS)
         live_price = fetch_live_price()
         now_iso = datetime.now(timezone.utc).isoformat()
+        recent_frame = df.tail(50)
 
         if live_price is not None:
             prediction["currentPrice"] = round(live_price, 2)
@@ -196,13 +197,13 @@ def generate_prediction():
         prediction["dataSource"] = "Twelve Data"
         prediction["symbol"] = DEFAULT_SYMBOL
         prediction["chartData"] = {
-            "prices": df["Close"].tail(50).tolist(),
-            "highs": df["High"].tail(50).tolist(),
-            "lows": df["Low"].tail(50).tolist(),
-            "ema20": df["EMA_20"].tail(50).tolist(),
-            "ema50": df["EMA_50"].tail(50).tolist(),
-            "vwap": df["VWAP"].tail(50).tolist(),
-            "timestamps": [timestamp.isoformat() for timestamp in df.index.tail(50)],
+            "prices": recent_frame["Close"].tolist(),
+            "highs": recent_frame["High"].tolist(),
+            "lows": recent_frame["Low"].tolist(),
+            "ema20": recent_frame["EMA_20"].tolist(),
+            "ema50": recent_frame["EMA_50"].tolist(),
+            "vwap": recent_frame["VWAP"].tolist(),
+            "timestamps": [timestamp.isoformat() for timestamp in recent_frame.index],
         }
 
         latest_prediction = prediction
