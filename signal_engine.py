@@ -446,8 +446,14 @@ def prepare_data(df, params=None):
         frame['High'], frame['Low'], frame['Close'], window=params['adx_window']
     ).adx()
 
-    # VWAP (session-based approximation)
-    frame['VWAP'] = (frame['Close'] * frame['Volume']).cumsum() / frame['Volume'].cumsum()
+    # VWAP fallback for spot feeds: when volume is missing/zero, use an expanding
+    # typical-price average so downstream charting and signal logic stay stable.
+    typical_price = (frame['High'] + frame['Low'] + frame['Close']) / 3.0
+    cumulative_volume = frame['Volume'].cumsum()
+    weighted_price = (typical_price * frame['Volume']).cumsum()
+    frame['VWAP'] = (weighted_price / cumulative_volume.replace(0, np.nan)).fillna(
+        typical_price.expanding(min_periods=1).mean()
+    )
 
     # Volume spike
     vol_mean = frame['Volume'].rolling(20, min_periods=5).mean()
