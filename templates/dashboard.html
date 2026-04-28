@@ -1,543 +1,1030 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Gold Predictor - Fixed</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            background: #0a0e1a;
-            color: #e0e0e0;
-            font-family: 'Segoe UI', system-ui, sans-serif;
-            min-height: 100vh;
-        }
-        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        background: #0a0e1a;
+        color: #e0e0e0;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        min-height: 100vh;
+      }
+      .container {
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 20px;
+      }
 
-        /* Header */
-        .header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 20px 0;
-            border-bottom: 1px solid #1a2332;
-            margin-bottom: 30px;
-        }
-        .header h1 {
-            font-size: 28px;
-            background: linear-gradient(135deg, #ffd700, #ffed4e);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        .status-badge {
-            padding: 8px 16px;
-            border-radius: 20px;
-            font-size: 14px;
-            font-weight: 600;
-        }
-        .status-active { background: rgba(0, 255, 136, 0.15); color: #00ff88; border: 1px solid rgba(0, 255, 136, 0.3); }
-        .status-error { background: rgba(255, 68, 68, 0.15); color: #ff4444; border: 1px solid rgba(255, 68, 68, 0.3); }
-        .status-loading { background: rgba(255, 193, 7, 0.15); color: #ffc107; border: 1px solid rgba(255, 193, 7, 0.3); }
+      /* Header */
+      .header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 20px 0;
+        border-bottom: 1px solid #1a2332;
+        margin-bottom: 30px;
+        gap: 16px;
+        flex-wrap: wrap;
+      }
+      .header h1 {
+        font-size: 28px;
+        background: linear-gradient(135deg, #ffd700, #ffed4e);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+      }
+      .header-actions {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+      .notification-btn {
+        padding: 10px 16px;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 215, 0, 0.35);
+        background: rgba(255, 215, 0, 0.08);
+        color: #ffd700;
+        font-size: 13px;
+        font-weight: 700;
+        cursor: pointer;
+        transition: all 0.2s ease;
+      }
+      .notification-btn:hover:not(:disabled) {
+        background: rgba(255, 215, 0, 0.15);
+        transform: translateY(-1px);
+      }
+      .notification-btn.enabled {
+        border-color: rgba(0, 255, 136, 0.35);
+        background: rgba(0, 255, 136, 0.12);
+        color: #00ff88;
+      }
+      .notification-btn.blocked {
+        border-color: rgba(255, 68, 68, 0.35);
+        background: rgba(255, 68, 68, 0.12);
+        color: #ff8888;
+        cursor: not-allowed;
+      }
+      .notification-state {
+        font-size: 12px;
+        color: #9ca3af;
+        max-width: 260px;
+        line-height: 1.4;
+      }
+      .status-badge {
+        padding: 8px 16px;
+        border-radius: 20px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .status-active {
+        background: rgba(0, 255, 136, 0.15);
+        color: #00ff88;
+        border: 1px solid rgba(0, 255, 136, 0.3);
+      }
+      .status-error {
+        background: rgba(255, 68, 68, 0.15);
+        color: #ff4444;
+        border: 1px solid rgba(255, 68, 68, 0.3);
+      }
+      .status-loading {
+        background: rgba(255, 193, 7, 0.15);
+        color: #ffc107;
+        border: 1px solid rgba(255, 193, 7, 0.3);
+      }
 
-        /* Main Grid */
+      /* Main Grid */
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 20px;
+        margin-bottom: 20px;
+      }
+      @media (max-width: 900px) {
         .grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            margin-bottom: 20px;
+          grid-template-columns: 1fr;
         }
-        @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+      }
 
-        /* Cards */
-        .card {
-            background: #111827;
-            border: 1px solid #1f2937;
-            border-radius: 16px;
-            padding: 24px;
-            transition: all 0.3s ease;
-        }
-        .card:hover { border-color: #374151; }
-        .card-title {
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #6b7280;
-            margin-bottom: 12px;
-        }
+      /* Cards */
+      .card {
+        background: #111827;
+        border: 1px solid #1f2937;
+        border-radius: 16px;
+        padding: 24px;
+        transition: all 0.3s ease;
+      }
+      .card:hover {
+        border-color: #374151;
+      }
+      .card-title {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        color: #6b7280;
+        margin-bottom: 12px;
+      }
 
-        /* Verdict Display */
-        .verdict-container {
-            text-align: center;
-            padding: 30px;
-        }
-        .verdict-text {
-            font-size: 48px;
-            font-weight: 800;
-            margin-bottom: 10px;
-        }
-        .verdict-bullish { color: #00ff88; text-shadow: 0 0 20px rgba(0, 255, 136, 0.3); }
-        .verdict-bearish { color: #ff4444; text-shadow: 0 0 20px rgba(255, 68, 68, 0.3); }
-        .verdict-neutral { color: #6b7280; }
-        .confidence-ring {
-            width: 120px;
-            height: 120px;
-            margin: 20px auto;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 24px;
-            font-weight: 700;
-            position: relative;
-        }
-        .confidence-ring::before {
-            content: '';
-            position: absolute;
-            inset: -4px;
-            border-radius: 50%;
-            padding: 4px;
-            background: conic-gradient(var(--ring-color) var(--ring-deg), transparent 0);
-            -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-            mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-            -webkit-mask-composite: xor;
-            mask-composite: exclude;
-        }
+      /* Verdict Display */
+      .verdict-container {
+        text-align: center;
+        padding: 30px;
+      }
+      .verdict-text {
+        font-size: 48px;
+        font-weight: 800;
+        margin-bottom: 10px;
+      }
+      .verdict-bullish {
+        color: #00ff88;
+        text-shadow: 0 0 20px rgba(0, 255, 136, 0.3);
+      }
+      .verdict-bearish {
+        color: #ff4444;
+        text-shadow: 0 0 20px rgba(255, 68, 68, 0.3);
+      }
+      .verdict-neutral {
+        color: #6b7280;
+      }
+      .confidence-ring {
+        width: 120px;
+        height: 120px;
+        margin: 20px auto;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 24px;
+        font-weight: 700;
+        position: relative;
+      }
+      .confidence-ring::before {
+        content: "";
+        position: absolute;
+        inset: -4px;
+        border-radius: 50%;
+        padding: 4px;
+        background: conic-gradient(
+          var(--ring-color) var(--ring-deg),
+          transparent 0
+        );
+        -webkit-mask:
+          linear-gradient(#fff 0 0) content-box,
+          linear-gradient(#fff 0 0);
+        mask:
+          linear-gradient(#fff 0 0) content-box,
+          linear-gradient(#fff 0 0);
+        -webkit-mask-composite: xor;
+        mask-composite: exclude;
+      }
 
-        /* Signal List */
-        .signal-list {
-            list-style: none;
-        }
-        .signal-item {
-            padding: 12px;
-            margin-bottom: 8px;
-            background: rgba(255, 255, 255, 0.03);
-            border-radius: 8px;
-            border-left: 3px solid #ffd700;
-            font-size: 14px;
-        }
-        .signal-item.bullish { border-left-color: #00ff88; }
-        .signal-item.bearish { border-left-color: #ff4444; }
+      /* Signal List */
+      .signal-list {
+        list-style: none;
+      }
+      .signal-item {
+        padding: 12px;
+        margin-bottom: 8px;
+        background: rgba(255, 255, 255, 0.03);
+        border-radius: 8px;
+        border-left: 3px solid #ffd700;
+        font-size: 14px;
+      }
+      .signal-item.bullish {
+        border-left-color: #00ff88;
+      }
+      .signal-item.bearish {
+        border-left-color: #ff4444;
+      }
 
-        /* Stats Grid */
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 12px;
-            margin-top: 16px;
-        }
-        .stat-box {
-            background: rgba(255, 255, 255, 0.03);
-            padding: 16px;
-            border-radius: 12px;
-            text-align: center;
-        }
-        .stat-value {
-            font-size: 24px;
-            font-weight: 700;
-            color: #ffd700;
-        }
-        .stat-label {
-            font-size: 11px;
-            color: #6b7280;
-            margin-top: 4px;
-        }
+      /* Stats Grid */
+      .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+        margin-top: 16px;
+      }
+      .stat-box {
+        background: rgba(255, 255, 255, 0.03);
+        padding: 16px;
+        border-radius: 12px;
+        text-align: center;
+      }
+      .stat-value {
+        font-size: 24px;
+        font-weight: 700;
+        color: #ffd700;
+      }
+      .stat-label {
+        font-size: 11px;
+        color: #6b7280;
+        margin-top: 4px;
+      }
 
-        /* Price Info */
-        .price-info {
-            display: flex;
-            justify-content: space-around;
-            padding: 20px;
-            background: rgba(255, 215, 0, 0.05);
-            border-radius: 12px;
-            margin-bottom: 20px;
-        }
-        .price-item {
-            text-align: center;
-        }
-        .price-value {
-            font-size: 28px;
-            font-weight: 700;
-            color: #ffd700;
-        }
-        .price-label {
-            font-size: 12px;
-            color: #6b7280;
-            margin-top: 4px;
-        }
+      /* Price Info */
+      .price-info {
+        display: flex;
+        justify-content: space-around;
+        padding: 20px;
+        background: rgba(255, 215, 0, 0.05);
+        border-radius: 12px;
+        margin-bottom: 20px;
+      }
+      .price-item {
+        text-align: center;
+      }
+      .price-value {
+        font-size: 28px;
+        font-weight: 700;
+        color: #ffd700;
+      }
+      .price-label {
+        font-size: 12px;
+        color: #6b7280;
+        margin-top: 4px;
+      }
 
-        /* Chart Container */
-        .chart-container {
-            position: relative;
-            height: 400px;
-            margin-top: 20px;
-        }
+      /* Chart Container */
+      .chart-container {
+        position: relative;
+        height: 400px;
+        margin-top: 20px;
+      }
 
-        /* Blockers */
-        .blocker-list {
-            list-style: none;
-            margin-top: 12px;
-        }
-        .blocker-item {
-            padding: 10px;
-            margin-bottom: 6px;
-            background: rgba(255, 68, 68, 0.1);
-            border-radius: 8px;
-            font-size: 13px;
-            color: #ff8888;
-        }
+      /* Blockers */
+      .blocker-list {
+        list-style: none;
+        margin-top: 12px;
+      }
+      .blocker-item {
+        padding: 10px;
+        margin-bottom: 6px;
+        background: rgba(255, 68, 68, 0.1);
+        border-radius: 8px;
+        font-size: 13px;
+        color: #ff8888;
+      }
 
-        /* Loading */
-        .loading {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            height: 200px;
-            font-size: 18px;
-            color: #6b7280;
+      /* Loading */
+      .loading {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 200px;
+        font-size: 18px;
+        color: #6b7280;
+      }
+      .spinner {
+        width: 40px;
+        height: 40px;
+        border: 3px solid #1f2937;
+        border-top-color: #ffd700;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+        margin-right: 16px;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
         }
-        .spinner {
-            width: 40px;
-            height: 40px;
-            border: 3px solid #1f2937;
-            border-top-color: #ffd700;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin-right: 16px;
-        }
-        @keyframes spin { to { transform: rotate(360deg); } }
+      }
 
-        /* Trade Button */
-        .trade-btn {
-            width: 100%;
-            padding: 16px;
-            border: none;
-            border-radius: 12px;
-            font-size: 18px;
-            font-weight: 700;
-            cursor: pointer;
-            transition: all 0.3s;
-            margin-top: 16px;
+      /* Trade Button */
+      .trade-btn {
+        width: 100%;
+        padding: 16px;
+        border: none;
+        border-radius: 12px;
+        font-size: 18px;
+        font-weight: 700;
+        cursor: pointer;
+        transition: all 0.3s;
+        margin-top: 16px;
+      }
+      .trade-btn.buy {
+        background: linear-gradient(135deg, #00ff88, #00cc6a);
+        color: #000;
+      }
+      .trade-btn.sell {
+        background: linear-gradient(135deg, #ff4444, #cc0000);
+        color: #fff;
+      }
+      .trade-btn:disabled {
+        background: #1f2937;
+        color: #6b7280;
+        cursor: not-allowed;
+      }
+      .trade-btn:hover:not(:disabled) {
+        transform: translateY(-2px);
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+      }
+
+      .toast-container {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        z-index: 1200;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        max-width: 360px;
+      }
+      .toast {
+        padding: 14px 16px;
+        border-radius: 14px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(17, 24, 39, 0.96);
+        color: #e5e7eb;
+        font-size: 13px;
+        line-height: 1.45;
+        box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+        animation: toast-in 0.22s ease;
+      }
+      .toast.success {
+        border-color: rgba(0, 255, 136, 0.35);
+      }
+      .toast.info {
+        border-color: rgba(59, 130, 246, 0.35);
+      }
+      .toast.warn {
+        border-color: rgba(245, 158, 11, 0.35);
+      }
+      .toast.error {
+        border-color: rgba(255, 68, 68, 0.35);
+      }
+
+      @keyframes toast-in {
+        from {
+          opacity: 0;
+          transform: translateY(-10px);
         }
-        .trade-btn.buy {
-            background: linear-gradient(135deg, #00ff88, #00cc6a);
-            color: #000;
+        to {
+          opacity: 1;
+          transform: translateY(0);
         }
-        .trade-btn.sell {
-            background: linear-gradient(135deg, #ff4444, #cc0000);
-            color: #fff;
+      }
+
+      @media (max-width: 900px) {
+        .header-actions {
+          justify-content: flex-start;
         }
-        .trade-btn:disabled {
-            background: #1f2937;
-            color: #6b7280;
-            cursor: not-allowed;
+        .toast-container {
+          left: 16px;
+          right: 16px;
+          max-width: none;
         }
-        .trade-btn:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
-        }
+      }
     </style>
-</head>
-<body>
+  </head>
+  <body>
+    <div id="toastContainer" class="toast-container"></div>
     <div class="container">
-        <div class="header">
-            <h1>🥇 XAUUSD Predictor</h1>
-            <div id="statusBadge" class="status-badge status-loading">Initializing...</div>
+      <div class="header">
+        <h1>🥇 XAUUSD Predictor</h1>
+        <div class="header-actions">
+          <button
+            id="notificationToggle"
+            class="notification-btn"
+            type="button"
+          >
+            Enable Alerts
+          </button>
+          <div id="notificationState" class="notification-state">
+            Browser alerts are off.
+          </div>
+          <div id="statusBadge" class="status-badge status-loading">
+            Initializing...
+          </div>
+        </div>
+      </div>
+
+      <div id="loadingState" class="loading">
+        <div class="spinner"></div>
+        Loading prediction data...
+      </div>
+
+      <div id="mainContent" style="display: none">
+        <!-- Price Info -->
+        <div class="price-info">
+          <div class="price-item">
+            <div class="price-value" id="currentPrice">--</div>
+            <div class="price-label">Current Price</div>
+          </div>
+          <div class="price-item">
+            <div class="price-value" id="signalPrice">--</div>
+            <div class="price-label">Signal Price</div>
+          </div>
+          <div class="price-item">
+            <div class="price-value" id="lastUpdate">--</div>
+            <div class="price-label">Last Update</div>
+          </div>
         </div>
 
-        <div id="loadingState" class="loading">
-            <div class="spinner"></div>
-            Loading prediction data...
+        <div class="grid">
+          <!-- Verdict Card -->
+          <div class="card">
+            <div class="card-title">Directional Verdict</div>
+            <div class="verdict-container">
+              <div class="verdict-text" id="verdictText">--</div>
+              <div class="confidence-ring" id="confidenceRing">
+                <span id="confidenceValue">--</span>
+              </div>
+              <div style="color: #6b7280; font-size: 14px">Confidence</div>
+            </div>
+
+            <div class="stats-grid">
+              <div class="stat-box">
+                <div class="stat-value" id="tradeabilityScore">--</div>
+                <div class="stat-label">Tradeability</div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-value" id="scoreValue">--</div>
+                <div class="stat-label">Signal Score</div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-value" id="rrValue">--</div>
+                <div class="stat-label">R:R Ratio</div>
+              </div>
+            </div>
+
+            <button id="tradeBtn" class="trade-btn" disabled>
+              Waiting for Signal...
+            </button>
+          </div>
+
+          <!-- Details Card -->
+          <div class="card">
+            <div class="card-title">Signal Analysis</div>
+            <ul class="signal-list" id="signalList">
+              <li class="signal-item">Loading signals...</li>
+            </ul>
+
+            <div style="margin-top: 20px">
+              <div class="card-title">Risk Management</div>
+              <div class="stats-grid">
+                <div class="stat-box">
+                  <div class="stat-value" id="slValue">--</div>
+                  <div class="stat-label">Stop Loss</div>
+                </div>
+                <div class="stat-box">
+                  <div class="stat-value" id="tpValue">--</div>
+                  <div class="stat-label">Take Profit</div>
+                </div>
+                <div class="stat-box">
+                  <div class="stat-value" id="pipValue">--</div>
+                  <div class="stat-label">Target Pips</div>
+                </div>
+              </div>
+            </div>
+
+            <div id="blockersSection" style="margin-top: 20px; display: none">
+              <div class="card-title" style="color: #ff4444">Blockers</div>
+              <ul class="blocker-list" id="blockerList"></ul>
+            </div>
+          </div>
         </div>
 
-        <div id="mainContent" style="display: none;">
-            <!-- Price Info -->
-            <div class="price-info">
-                <div class="price-item">
-                    <div class="price-value" id="currentPrice">--</div>
-                    <div class="price-label">Current Price</div>
-                </div>
-                <div class="price-item">
-                    <div class="price-value" id="signalPrice">--</div>
-                    <div class="price-label">Signal Price</div>
-                </div>
-                <div class="price-item">
-                    <div class="price-value" id="lastUpdate">--</div>
-                    <div class="price-label">Last Update</div>
-                </div>
-            </div>
-
-            <div class="grid">
-                <!-- Verdict Card -->
-                <div class="card">
-                    <div class="card-title">Directional Verdict</div>
-                    <div class="verdict-container">
-                        <div class="verdict-text" id="verdictText">--</div>
-                        <div class="confidence-ring" id="confidenceRing">
-                            <span id="confidenceValue">--</span>
-                        </div>
-                        <div style="color: #6b7280; font-size: 14px;">Confidence</div>
-                    </div>
-
-                    <div class="stats-grid">
-                        <div class="stat-box">
-                            <div class="stat-value" id="tradeabilityScore">--</div>
-                            <div class="stat-label">Tradeability</div>
-                        </div>
-                        <div class="stat-box">
-                            <div class="stat-value" id="scoreValue">--</div>
-                            <div class="stat-label">Signal Score</div>
-                        </div>
-                        <div class="stat-box">
-                            <div class="stat-value" id="rrValue">--</div>
-                            <div class="stat-label">R:R Ratio</div>
-                        </div>
-                    </div>
-
-                    <button id="tradeBtn" class="trade-btn" disabled>Waiting for Signal...</button>
-                </div>
-
-                <!-- Details Card -->
-                <div class="card">
-                    <div class="card-title">Signal Analysis</div>
-                    <ul class="signal-list" id="signalList">
-                        <li class="signal-item">Loading signals...</li>
-                    </ul>
-
-                    <div style="margin-top: 20px;">
-                        <div class="card-title">Risk Management</div>
-                        <div class="stats-grid">
-                            <div class="stat-box">
-                                <div class="stat-value" id="slValue">--</div>
-                                <div class="stat-label">Stop Loss</div>
-                            </div>
-                            <div class="stat-box">
-                                <div class="stat-value" id="tpValue">--</div>
-                                <div class="stat-label">Take Profit</div>
-                            </div>
-                            <div class="stat-box">
-                                <div class="stat-value" id="pipValue">--</div>
-                                <div class="stat-label">Target Pips</div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div id="blockersSection" style="margin-top: 20px; display: none;">
-                        <div class="card-title" style="color: #ff4444;">Blockers</div>
-                        <ul class="blocker-list" id="blockerList"></ul>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Chart -->
-            <div class="card">
-                <div class="card-title">Price Action & Signals</div>
-                <div class="chart-container">
-                    <canvas id="priceChart"></canvas>
-                </div>
-            </div>
+        <!-- Chart -->
+        <div class="card">
+          <div class="card-title">Price Action & Signals</div>
+          <div class="chart-container">
+            <canvas id="priceChart"></canvas>
+          </div>
         </div>
+      </div>
     </div>
 
     <script>
-        let priceChart = null;
-        let refreshInterval = null;
+      let priceChart = null;
+      let refreshInterval = null;
+      let previousSignalSnapshot = null;
+      let alertsEnabled =
+        localStorage.getItem("xauusd.browserAlertsEnabled") === "true";
 
-        async function fetchPrediction() {
-            try {
-                const response = await fetch('/api/prediction');
-                const data = await response.json();
-                updateDashboard(data);
-            } catch (error) {
-                console.error('Fetch error:', error);
-                showError('Failed to fetch prediction data');
-            }
+      function notificationsSupported() {
+        return typeof window !== "undefined" && "Notification" in window;
+      }
+
+      function isActionableState(actionState) {
+        return actionState === "LONG_ACTIVE" || actionState === "SHORT_ACTIVE";
+      }
+
+      function normalizeSignalText(signal) {
+        return String(signal || "")
+          .replace(/\([^)]*\d[^)]*\)/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+      }
+
+      function buildSignalSnapshot(data) {
+        if (!data || data.error || data.status === "initializing") {
+          return null;
         }
 
-        function updateDashboard(data) {
-            // Hide loading, show content
-            document.getElementById('loadingState').style.display = 'none';
-            document.getElementById('mainContent').style.display = 'block';
+        const signals = Array.isArray(data.signals)
+          ? data.signals.slice(0, 4)
+          : [];
+        const normalizedSignals = signals.map(normalizeSignalText);
+        const blockers = Array.isArray(data.blockers) ? data.blockers : [];
+        const confidence = Number.isFinite(Number(data.confidence))
+          ? Number(data.confidence)
+          : 0;
+        const score = Number.isFinite(
+          Number(data.forecast && data.forecast.score),
+        )
+          ? Number(data.forecast.score)
+          : 0;
 
-            // Update status
-            const statusBadge = document.getElementById('statusBadge');
-            if (data.error) {
-                statusBadge.className = 'status-badge status-error';
-                statusBadge.textContent = 'Error';
-            } else if (data.status === 'initializing') {
-                statusBadge.className = 'status-badge status-loading';
-                statusBadge.textContent = 'Initializing...';
-            } else {
-                statusBadge.className = 'status-badge status-active';
-                statusBadge.textContent = 'Live';
-            }
+        return {
+          verdict: data.verdict || "Neutral",
+          action: data.action || "hold",
+          actionState: data.actionState || "WAIT",
+          tradeabilityLabel: data.tradeabilityLabel || "Low",
+          confidence: confidence,
+          score: score,
+          signals: signals,
+          signalsKey: normalizedSignals.join("|"),
+          blockersKey: blockers.join("|"),
+          hasBlockers: blockers.length > 0,
+          currentPrice: data.currentPrice || null,
+          entryPrice: data.entryPrice || null,
+          timestamp: data.lastUpdate || data.timestamp || null,
+          summaryLine: `${data.verdict || "Neutral"} · ${Math.round(confidence)}% · ${data.actionState || "WAIT"}`,
+        };
+      }
 
-            // Update prices
-            document.getElementById('currentPrice').textContent = 
-                data.currentPrice ? '$' + data.currentPrice.toLocaleString() : '--';
-            document.getElementById('signalPrice').textContent = 
-                data.entryPrice ? '$' + data.entryPrice.toLocaleString() : '--';
-            document.getElementById('lastUpdate').textContent = 
-                data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : '--';
+      function buildAlertTitle(previous, current) {
+        if (
+          previous.actionState !== current.actionState &&
+          isActionableState(current.actionState)
+        ) {
+          return current.action === "buy"
+            ? "XAU/USD long signal active"
+            : "XAU/USD short signal active";
+        }
+        if (previous.verdict !== current.verdict) {
+          return `XAU/USD bias changed to ${current.verdict}`;
+        }
+        if (previous.hasBlockers && !current.hasBlockers) {
+          return "XAU/USD blockers cleared";
+        }
+        return "XAU/USD signal update";
+      }
 
-            // Update verdict
-            const verdictEl = document.getElementById('verdictText');
-            verdictEl.textContent = data.verdict || 'Neutral';
-            verdictEl.className = 'verdict-text ' + 
-                (data.verdict === 'Bullish' ? 'verdict-bullish' : 
-                 data.verdict === 'Bearish' ? 'verdict-bearish' : 'verdict-neutral');
-
-            // Update confidence ring
-            const confidence = data.confidence || 50;
-            const ringEl = document.getElementById('confidenceRing');
-            const ringColor = data.verdict === 'Bullish' ? '#00ff88' : 
-                             data.verdict === 'Bearish' ? '#ff4444' : '#6b7280';
-            ringEl.style.setProperty('--ring-color', ringColor);
-            ringEl.style.setProperty('--ring-deg', (confidence / 100 * 360) + 'deg');
-            document.getElementById('confidenceValue').textContent = confidence + '%';
-
-            // Update stats
-            document.getElementById('tradeabilityScore').textContent = 
-                data.tradeabilityLabel || 'Low';
-            document.getElementById('scoreValue').textContent = 
-                data.forecast ? data.forecast.score : '--';
-            document.getElementById('rrValue').textContent = data.rrRatio || '--';
-
-            // Update signals
-            const signalList = document.getElementById('signalList');
-            if (data.signals && data.signals.length > 0) {
-                signalList.innerHTML = data.signals.map(s => {
-                    const isBullish = s.toLowerCase().includes('bullish');
-                    const isBearish = s.toLowerCase().includes('bearish');
-                    const cls = isBullish ? 'bullish' : isBearish ? 'bearish' : '';
-                    return `<li class="signal-item ${cls}">${s}</li>`;
-                }).join('');
-            } else {
-                signalList.innerHTML = '<li class="signal-item">No active signals</li>';
-            }
-
-            // Update risk management
-            document.getElementById('slValue').textContent = data.stopLoss || '--';
-            document.getElementById('tpValue').textContent = data.takeProfit || '--';
-            document.getElementById('pipValue').textContent = data.tpPips || '--';
-
-            // Update blockers
-            const blockersSection = document.getElementById('blockersSection');
-            if (data.blockers && data.blockers.length > 0) {
-                blockersSection.style.display = 'block';
-                document.getElementById('blockerList').innerHTML = 
-                    data.blockers.map(b => `<li class="blocker-item">⚠️ ${b}</li>`).join('');
-            } else {
-                blockersSection.style.display = 'none';
-            }
-
-            // Update trade button
-            const tradeBtn = document.getElementById('tradeBtn');
-            if (data.action === 'buy') {
-                tradeBtn.textContent = '🚀 ENTER LONG';
-                tradeBtn.className = 'trade-btn buy';
-                tradeBtn.disabled = false;
-            } else if (data.action === 'sell') {
-                tradeBtn.textContent = '🔻 ENTER SHORT';
-                tradeBtn.className = 'trade-btn sell';
-                tradeBtn.disabled = false;
-            } else {
-                tradeBtn.textContent = 'Waiting for Signal...';
-                tradeBtn.className = 'trade-btn';
-                tradeBtn.disabled = true;
-            }
-
-            // Update chart
-            if (data.chartData) {
-                updateChart(data.chartData, data.verdict);
-            }
+      function describeImportantChange(previous, current) {
+        if (!previous || !current) {
+          return null;
         }
 
-        function updateChart(chartData, verdict) {
-            const ctx = document.getElementById('priceChart').getContext('2d');
+        const changes = [];
+        let severity = "info";
 
-            if (priceChart) {
-                priceChart.destroy();
-            }
-
-            const labels = chartData.timestamps.map(t => new Date(t).toLocaleTimeString());
-            const borderColor = verdict === 'Bullish' ? '#00ff88' : 
-                               verdict === 'Bearish' ? '#ff4444' : '#ffd700';
-
-            priceChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: labels,
-                    datasets: [
-                        {
-                            label: 'Price',
-                            data: chartData.prices,
-                            borderColor: borderColor,
-                            backgroundColor: borderColor + '20',
-                            borderWidth: 2,
-                            fill: true,
-                            tension: 0.4,
-                            pointRadius: 0
-                        },
-                        {
-                            label: 'EMA 20',
-                            data: chartData.ema20,
-                            borderColor: '#3b82f6',
-                            borderWidth: 1,
-                            pointRadius: 0,
-                            borderDash: [5, 5]
-                        },
-                        {
-                            label: 'EMA 50',
-                            data: chartData.ema50,
-                            borderColor: '#8b5cf6',
-                            borderWidth: 1,
-                            pointRadius: 0,
-                            borderDash: [5, 5]
-                        },
-                        {
-                            label: 'VWAP',
-                            data: chartData.vwap,
-                            borderColor: '#f59e0b',
-                            borderWidth: 1,
-                            pointRadius: 0
-                        }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    interaction: {
-                        intersect: false,
-                        mode: 'index'
-                    },
-                    plugins: {
-                        legend: {
-                            labels: { color: '#6b7280' }
-                        }
-                    },
-                    scales: {
-                        x: {
-                            grid: { color: '#1f2937' },
-                            ticks: { color: '#6b7280', maxTicksLimit: 8 }
-                        },
-                        y: {
-                            grid: { color: '#1f2937' },
-                            ticks: { color: '#6b7280' }
-                        }
-                    }
-                }
-            });
+        if (previous.actionState !== current.actionState) {
+          changes.push(
+            `Action ${previous.actionState} -> ${current.actionState}`,
+          );
+          severity = isActionableState(current.actionState)
+            ? "success"
+            : "warn";
+        }
+        if (previous.verdict !== current.verdict) {
+          changes.push(`Bias ${previous.verdict} -> ${current.verdict}`);
+        }
+        if (previous.tradeabilityLabel !== current.tradeabilityLabel) {
+          changes.push(
+            `Tradeability ${previous.tradeabilityLabel} -> ${current.tradeabilityLabel}`,
+          );
+        }
+        if (
+          previous.signalsKey !== current.signalsKey &&
+          current.signals.length
+        ) {
+          changes.push(`Lead signal: ${current.signals[0]}`);
+        }
+        if (previous.hasBlockers !== current.hasBlockers) {
+          changes.push(
+            current.hasBlockers ? "New blockers detected" : "Blockers cleared",
+          );
+        }
+        if (Math.abs(current.confidence - previous.confidence) >= 10) {
+          changes.push(
+            `Confidence ${Math.round(previous.confidence)}% -> ${Math.round(current.confidence)}%`,
+          );
+        }
+        if (Math.abs(current.score - previous.score) >= 10) {
+          changes.push(
+            `Signal score ${Math.round(previous.score)} -> ${Math.round(current.score)}`,
+          );
         }
 
-        function showError(message) {
-            document.getElementById('loadingState').innerHTML = 
-                `<div style="color: #ff4444;">❌ ${message}</div>`;
+        if (!changes.length) {
+          return null;
         }
 
-        // Initialize
-        fetchPrediction();
-        refreshInterval = setInterval(fetchPrediction, 30000); // Refresh every 30s
+        return {
+          title: buildAlertTitle(previous, current),
+          body: changes.join(" | "),
+          severity: severity,
+        };
+      }
+
+      function showToast(message, severity = "info") {
+        const container = document.getElementById("toastContainer");
+        if (!container) {
+          return;
+        }
+
+        const toast = document.createElement("div");
+        toast.className = `toast ${severity}`;
+        toast.textContent = message;
+        container.appendChild(toast);
+
+        window.setTimeout(() => {
+          toast.remove();
+        }, 5000);
+      }
+
+      function updateNotificationControls() {
+        const button = document.getElementById("notificationToggle");
+        const state = document.getElementById("notificationState");
+        if (!button || !state) {
+          return;
+        }
+
+        if (!notificationsSupported()) {
+          button.disabled = true;
+          button.textContent = "Alerts Unavailable";
+          state.textContent = "This browser does not support notifications.";
+          return;
+        }
+
+        if (Notification.permission === "denied") {
+          alertsEnabled = false;
+          localStorage.setItem("xauusd.browserAlertsEnabled", "false");
+          button.disabled = true;
+          button.className = "notification-btn blocked";
+          button.textContent = "Notifications Blocked";
+          state.textContent =
+            "Allow notifications in browser settings to enable alerts.";
+          return;
+        }
+
+        button.disabled = false;
+        if (alertsEnabled && Notification.permission === "granted") {
+          button.className = "notification-btn enabled";
+          button.textContent = "Pause Alerts";
+          state.textContent =
+            "Browser alerts are on for important signal changes.";
+        } else if (Notification.permission === "granted") {
+          button.className = "notification-btn";
+          button.textContent = "Enable Alerts";
+          state.textContent =
+            "Notifications are allowed, but alerts are paused on this device.";
+        } else {
+          button.className = "notification-btn";
+          button.textContent = "Enable Alerts";
+          state.textContent =
+            "Turn on browser alerts for important signal changes.";
+        }
+      }
+
+      async function toggleAlerts() {
+        if (!notificationsSupported()) {
+          showToast(
+            "Browser notifications are not supported on this device.",
+            "error",
+          );
+          return;
+        }
+
+        if (alertsEnabled && Notification.permission === "granted") {
+          alertsEnabled = false;
+          localStorage.setItem("xauusd.browserAlertsEnabled", "false");
+          updateNotificationControls();
+          showToast("Browser alerts paused for this device.", "info");
+          return;
+        }
+
+        if (Notification.permission === "denied") {
+          updateNotificationControls();
+          showToast(
+            "Notifications are blocked in this browser. Update site permissions to enable alerts.",
+            "error",
+          );
+          return;
+        }
+
+        let permission = Notification.permission;
+        if (permission !== "granted") {
+          permission = await Notification.requestPermission();
+        }
+
+        alertsEnabled = permission === "granted";
+        localStorage.setItem(
+          "xauusd.browserAlertsEnabled",
+          String(alertsEnabled),
+        );
+        updateNotificationControls();
+
+        if (alertsEnabled) {
+          showToast(
+            "Browser alerts enabled. You will be notified when important signals change.",
+            "success",
+          );
+        } else {
+          showToast("Notification permission was not granted.", "warn");
+        }
+      }
+
+      function sendBrowserNotification(title, body, severity) {
+        if (
+          !alertsEnabled ||
+          !notificationsSupported() ||
+          Notification.permission !== "granted"
+        ) {
+          return;
+        }
+        if (document.visibilityState === "visible") {
+          return;
+        }
+
+        try {
+          const notification = new Notification(title, {
+            body: body,
+            tag: "xauusd-important-signal",
+            renotify: true,
+            requireInteraction: severity === "success",
+          });
+          notification.onclick = () => {
+            window.focus();
+            notification.close();
+          };
+        } catch (error) {
+          console.error("Notification error:", error);
+        }
+      }
+
+      function handleImportantSignalChange(data) {
+        const currentSnapshot = buildSignalSnapshot(data);
+        if (!currentSnapshot) {
+          return;
+        }
+
+        if (!previousSignalSnapshot) {
+          previousSignalSnapshot = currentSnapshot;
+          return;
+        }
+
+        const change = describeImportantChange(
+          previousSignalSnapshot,
+          currentSnapshot,
+        );
+        previousSignalSnapshot = currentSnapshot;
+
+        if (!change) {
+          return;
+        }
+
+        showToast(`${change.title}: ${change.body}`, change.severity);
+        sendBrowserNotification(change.title, change.body, change.severity);
+      }
+
+      async function fetchPrediction() {
+        try {
+          const response = await fetch("/api/prediction");
+          const data = await response.json();
+          updateDashboard(data);
+        } catch (error) {
+          console.error("Fetch error:", error);
+          showError("Failed to fetch prediction data");
+        }
+      }
+
+      function updateDashboard(data) {
+        // Hide loading, show content
+        document.getElementById("loadingState").style.display = "none";
+        document.getElementById("mainContent").style.display = "block";
+
+        // Update status
+        const statusBadge = document.getElementById("statusBadge");
+        if (data.error) {
+          statusBadge.className = "status-badge status-error";
+          statusBadge.textContent = "Error";
+        } else if (data.status === "initializing") {
+          statusBadge.className = "status-badge status-loading";
+          statusBadge.textContent = "Initializing...";
+        } else {
+          statusBadge.className = "status-badge status-active";
+          statusBadge.textContent = "Live";
+        }
+
+        // Update prices
+        document.getElementById("currentPrice").textContent = data.currentPrice
+          ? "$" + data.currentPrice.toLocaleString()
+          : "--";
+        document.getElementById("signalPrice").textContent = data.entryPrice
+          ? "$" + data.entryPrice.toLocaleString()
+          : "--";
+        document.getElementById("lastUpdate").textContent = data.timestamp
+          ? new Date(data.timestamp).toLocaleTimeString()
+          : "--";
+
+        // Update verdict
+        const verdictEl = document.getElementById("verdictText");
+        verdictEl.textContent = data.verdict || "Neutral";
+        verdictEl.className =
+          "verdict-text " +
+          (data.verdict === "Bullish"
+            ? "verdict-bullish"
+            : data.verdict === "Bearish"
+              ? "verdict-bearish"
+              : "verdict-neutral");
+
+        // Update confidence ring
+        const confidence = data.confidence || 50;
+        const ringEl = document.getElementById("confidenceRing");
+        const ringColor =
+          data.verdict === "Bullish"
+            ? "#00ff88"
+            : data.verdict === "Bearish"
+              ? "#ff4444"
+              : "#6b7280";
+        ringEl.style.setProperty("--ring-color", ringColor);
+        ringEl.style.setProperty(
+          "--ring-deg",
+          (confidence / 100) * 360 + "deg",
+        );
+        document.getElementById("confidenceValue").textContent =
+          confidence + "%";
+
+        // Update stats
+        document.getElementById("tradeabilityScore").textContent =
+          data.tradeabilityLabel || "Low";
+        document.getElementById("scoreValue").textContent = data.forecast
+          ? data.forecast.score
+          : "--";
+        document.getElementById("rrValue").textContent = data.rrRatio || "--";
+
+        // Update signals
+        const signalList = document.getElementById("signalList");
+        if (data.signals && data.signals.length > 0) {
+          signalList.innerHTML = data.signals
+            .map((s) => {
+              const isBullish = s.toLowerCase().includes("bullish");
+              const isBearish = s.toLowerCase().includes("bearish");
+              const cls = isBullish ? "bullish" : isBearish ? "bearish" : "";
+              return `<li class="signal-item ${cls}">${s}</li>`;
+            })
+            .join("");
+        } else {
+          signalList.innerHTML =
+            '<li class="signal-item">No active signals</li>';
+        }
+
+        // Update risk management
+        document.getElementById("slValue").textContent = data.stopLoss || "--";
+        document.getElementById("tpValue").textContent =
+          data.takeProfit || "--";
+        document.getElementById("pipValue").textContent = data.tpPips || "--";
+
+        // Update blockers
+        const blockersSection = document.getElementById("blockersSection");
+        if (data.blockers && data.blockers.length > 0) {
+          blockersSection.style.display = "block";
+          document.getElementById("blockerList").innerHTML = data.blockers
+            .map((b) => `<li class="blocker-item">⚠️ ${b}</li>`)
+            .join("");
+        } else {
+          blockersSection.style.display = "none";
+        }
+
+        // Update trade button
+        const tradeBtn = document.getElementById("tradeBtn");
+        if (data.action === "buy") {
+          tradeBtn.textContent = "🚀 ENTER LONG";
+          tradeBtn.className = "trade-btn buy";
+          tradeBtn.disabled = false;
+        } else if (data.action === "sell") {
+          tradeBtn.textContent = "🔻 ENTER SHORT";
+          tradeBtn.className = "trade-btn sell";
+          tradeBtn.disabled = false;
+        } else {
+          tradeBtn.textContent = "Waiting for Signal...";
+          tradeBtn.className = "trade-btn";
+          tradeBtn.disabled = true;
+        }
+
+        // Update chart
+        if (data.chartData) {
+          updateChart(data.chartData, data.verdict);
+        }
+
+        handleImportantSignalChange(data);
+      }
+
+      function updateChart(chartData, verdict) {
+        const ctx = document.getElementById("priceChart").getContext("2d");
+
+        if (priceChart) {
+          priceChart.destroy();
+        }
+
+        const labels = chartData.timestamps.map((t) =>
+          new Date(t).toLocaleTimeString(),
+        );
+        const borderColor =
+          verdict === "Bullish"
+            ? "#00ff88"
+            : verdict === "Bearish"
+              ? "#ff4444"
+              : "#ffd700";
+
+        priceChart = new Chart(ctx, {
+          type: "line",
+          data: {
+            labels: labels,
+            datasets: [
+              {
+                label: "Price",
+                data: chartData.prices,
+                borderColor: borderColor,
+                backgroundColor: borderColor + "20",
+                borderWidth: 2,
+                fill: true,
+                tension: 0.4,
+                pointRadius: 0,
+              },
+              {
+                label: "EMA 20",
+                data: chartData.ema20,
+                borderColor: "#3b82f6",
+                borderWidth: 1,
+                pointRadius: 0,
+                borderDash: [5, 5],
+              },
+              {
+                label: "EMA 50",
+                data: chartData.ema50,
+                borderColor: "#8b5cf6",
+                borderWidth: 1,
+                pointRadius: 0,
+                borderDash: [5, 5],
+              },
+              {
+                label: "VWAP",
+                data: chartData.vwap,
+                borderColor: "#f59e0b",
+                borderWidth: 1,
+                pointRadius: 0,
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+              intersect: false,
+              mode: "index",
+            },
+            plugins: {
+              legend: {
+                labels: { color: "#6b7280" },
+              },
+            },
+            scales: {
+              x: {
+                grid: { color: "#1f2937" },
+                ticks: { color: "#6b7280", maxTicksLimit: 8 },
+              },
+              y: {
+                grid: { color: "#1f2937" },
+                ticks: { color: "#6b7280" },
+              },
+            },
+          },
+        });
+      }
+
+      function showError(message) {
+        document.getElementById("loadingState").innerHTML =
+          `<div style="color: #ff4444;">❌ ${message}</div>`;
+      }
+
+      // Initialize
+      document
+        .getElementById("notificationToggle")
+        .addEventListener("click", toggleAlerts);
+      updateNotificationControls();
+      fetchPrediction();
+      refreshInterval = setInterval(fetchPrediction, 30000); // Refresh every 30s
     </script>
-</body>
+  </body>
 </html>
