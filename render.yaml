@@ -16,7 +16,7 @@ services:
         value: 1h
       - key: PREDICTOR_PERIOD
         value: 5d
-      - key: PREDICTION_REFRESH_MINUTES
+      - key: PREDICTION_REFRESH_SECONDS
         value: 5
       - key: TZ
         value: UTC

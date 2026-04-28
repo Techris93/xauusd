@@ -34,6 +34,21 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+
+def _read_prediction_refresh_seconds():
+    configured_seconds = os.getenv("PREDICTION_REFRESH_SECONDS", "").strip()
+    legacy_seconds = os.getenv("PREDICTION_REFRESH_MINUTES", "").strip()
+    raw_value = configured_seconds or legacy_seconds or "5"
+
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        logger.warning(
+            "Invalid prediction refresh interval %r; defaulting to 5 seconds.",
+            raw_value,
+        )
+        return 5
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
@@ -41,8 +56,8 @@ TD_OUTPUT_TIMEZONE = "UTC"
 DEFAULT_SYMBOL = os.getenv("TWELVE_DATA_SYMBOL", "XAU/USD").strip() or "XAU/USD"
 DEFAULT_PERIOD = os.getenv("PREDICTOR_PERIOD", "5d").strip() or "5d"
 DEFAULT_INTERVAL = os.getenv("PREDICTOR_INTERVAL", "1h").strip() or "1h"
-REFRESH_MINUTES = max(1, int(os.getenv("PREDICTION_REFRESH_MINUTES", "5")))
-MAX_PREDICTION_STALENESS = timedelta(minutes=max(REFRESH_MINUTES * 2, 10))
+REFRESH_SECONDS = _read_prediction_refresh_seconds()
+MAX_PREDICTION_STALENESS = timedelta(seconds=max(REFRESH_SECONDS * 4, 20))
 WEB_PUSH_SUBJECT = (
     os.getenv("WEB_PUSH_SUBJECT", "mailto:notifications@xauusd.local").strip()
     or "mailto:notifications@xauusd.local"
@@ -736,7 +751,7 @@ def start_prediction_scheduler():
     scheduler.add_job(
         generate_prediction,
         "interval",
-        minutes=REFRESH_MINUTES,
+        seconds=REFRESH_SECONDS,
         id="prediction_job",
         replace_existing=True,
         max_instances=1,
