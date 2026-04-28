@@ -508,6 +508,14 @@
           >
             Enable Alerts
           </button>
+          <button
+            id="notificationTest"
+            class="notification-btn"
+            type="button"
+            hidden
+          >
+            Test Push
+          </button>
           <div id="notificationState" class="notification-state">
             Choose how this device receives signal alerts.
           </div>
@@ -919,6 +927,43 @@
         });
       }
 
+      async function sendTestPush() {
+        try {
+          if (!usingPushAlerts()) {
+            await ensurePushSubscription();
+            persistAlertPreference(true);
+          }
+
+          const endpoint = pushSubscription ? pushSubscription.endpoint : null;
+          if (!endpoint) {
+            throw new Error("This device does not have an active push subscription.");
+          }
+
+          const response = await fetch("/api/notifications/test", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ endpoint: endpoint }),
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok || !payload.ok) {
+            throw new Error(payload.error || "The test push could not be delivered.");
+          }
+
+          pushConfig = null;
+          await fetchNotificationConfig();
+          showToast("Test push sent to this device.", "success");
+        } catch (error) {
+          console.error("Test push failed:", error);
+          showToast(
+            error && error.message
+              ? error.message
+              : "The test push could not be delivered.",
+            "error",
+          );
+          updateNotificationControls();
+        }
+      }
+
       async function ensurePushSubscription() {
         if (
           !pushConfig ||
@@ -1034,10 +1079,14 @@
 
       function updateNotificationControls() {
         const button = document.getElementById("notificationToggle");
+        const testButton = document.getElementById("notificationTest");
         const state = document.getElementById("notificationState");
-        if (!button || !state) {
+        if (!button || !testButton || !state) {
           return;
         }
+
+        testButton.hidden = true;
+        testButton.disabled = true;
 
         const pushSupported = pushAlertsSupported();
         const pushAvailable = canUsePushAlerts();
@@ -1082,6 +1131,8 @@
         if (usingPushAlerts()) {
           button.className = "notification-btn enabled";
           button.textContent = "Pause Push Alerts";
+          testButton.hidden = false;
+          testButton.disabled = false;
           state.textContent =
             "Push alerts are active. Important signal changes can reach this device even after you close the page.";
           return;
@@ -1432,6 +1483,9 @@
       document
         .getElementById("notificationToggle")
         .addEventListener("click", toggleAlerts);
+      document
+        .getElementById("notificationTest")
+        .addEventListener("click", sendTestPush);
       bootstrapNotifications();
       fetchPrediction();
       refreshInterval = setInterval(fetchPrediction, 30000);
