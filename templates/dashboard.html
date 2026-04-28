@@ -16,6 +16,7 @@
         color: #e0e0e0;
         font-family: "Segoe UI", system-ui, sans-serif;
         min-height: 100vh;
+        overflow-x: hidden;
       }
       .container {
         max-width: 1400px;
@@ -48,6 +49,9 @@
         justify-content: flex-end;
       }
       .notification-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         padding: 10px 16px;
         border-radius: 999px;
         border: 1px solid rgba(255, 215, 0, 0.35);
@@ -78,6 +82,7 @@
         color: #9ca3af;
         max-width: 260px;
         line-height: 1.4;
+        overflow-wrap: anywhere;
       }
       .status-badge {
         padding: 8px 16px;
@@ -121,6 +126,7 @@
         border-radius: 16px;
         padding: 24px;
         transition: all 0.3s ease;
+        overflow: hidden;
       }
       .card:hover {
         border-color: #374151;
@@ -197,6 +203,7 @@
         border-radius: 8px;
         border-left: 3px solid #ffd700;
         font-size: 14px;
+        line-height: 1.5;
       }
       .signal-item.bullish {
         border-left-color: #00ff88;
@@ -217,9 +224,10 @@
         padding: 16px;
         border-radius: 12px;
         text-align: center;
+        min-width: 0;
       }
       .stat-value {
-        font-size: 24px;
+        font-size: clamp(20px, 4vw, 24px);
         font-weight: 700;
         color: #ffd700;
       }
@@ -231,8 +239,9 @@
 
       /* Price Info */
       .price-info {
-        display: flex;
-        justify-content: space-around;
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
         padding: 20px;
         background: rgba(255, 215, 0, 0.05);
         border-radius: 12px;
@@ -240,11 +249,17 @@
       }
       .price-item {
         text-align: center;
+        min-width: 0;
+        padding: 14px 12px;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        border-radius: 12px;
       }
       .price-value {
-        font-size: 28px;
+        font-size: clamp(22px, 4vw, 28px);
         font-weight: 700;
         color: #ffd700;
+        overflow-wrap: anywhere;
       }
       .price-label {
         font-size: 12px;
@@ -255,7 +270,7 @@
       /* Chart Container */
       .chart-container {
         position: relative;
-        height: 400px;
+        height: 380px;
         margin-top: 20px;
       }
 
@@ -271,6 +286,7 @@
         border-radius: 8px;
         font-size: 13px;
         color: #ff8888;
+        line-height: 1.5;
       }
 
       /* Loading */
@@ -382,6 +398,101 @@
           max-width: none;
         }
       }
+
+      @media (max-width: 720px) {
+        .container {
+          padding: 14px;
+        }
+        .header {
+          align-items: stretch;
+          padding: 16px 0;
+          margin-bottom: 20px;
+        }
+        .header h1 {
+          font-size: 24px;
+        }
+        .header-actions {
+          width: 100%;
+          display: grid;
+          grid-template-columns: 1fr;
+          justify-content: stretch;
+        }
+        .notification-btn,
+        .status-badge {
+          width: 100%;
+          text-align: center;
+        }
+        .notification-state {
+          max-width: none;
+        }
+        .price-info {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          padding: 14px;
+        }
+        .price-item:last-child {
+          grid-column: 1 / -1;
+        }
+        .card {
+          padding: 18px;
+        }
+        .verdict-container {
+          padding: 14px 8px 6px;
+        }
+        .verdict-text {
+          font-size: 36px;
+        }
+        .confidence-ring {
+          width: 102px;
+          height: 102px;
+          font-size: 20px;
+        }
+        .stats-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .stats-grid .stat-box:last-child {
+          grid-column: 1 / -1;
+        }
+        .trade-btn {
+          padding: 14px;
+          font-size: 16px;
+        }
+        .chart-container {
+          height: 280px;
+        }
+      }
+
+      @media (max-width: 420px) {
+        .header h1 {
+          font-size: 22px;
+        }
+        .price-info {
+          grid-template-columns: 1fr;
+        }
+        .price-item:last-child {
+          grid-column: auto;
+        }
+        .stats-grid {
+          grid-template-columns: 1fr;
+        }
+        .stats-grid .stat-box:last-child {
+          grid-column: auto;
+        }
+        .verdict-text {
+          font-size: 30px;
+        }
+        .signal-item,
+        .blocker-item {
+          font-size: 13px;
+        }
+        .chart-container {
+          height: 240px;
+        }
+        .toast-container {
+          top: 12px;
+          left: 12px;
+          right: 12px;
+        }
+      }
     </style>
   </head>
   <body>
@@ -398,7 +509,7 @@
             Enable Alerts
           </button>
           <div id="notificationState" class="notification-state">
-            Browser alerts are off.
+            Choose how this device receives signal alerts.
           </div>
           <div id="statusBadge" class="status-badge status-loading">
             Initializing...
@@ -503,14 +614,86 @@
     </div>
 
     <script>
+      const ALERT_STORAGE_KEY = "xauusd.pushAlertsEnabled";
+
       let priceChart = null;
       let refreshInterval = null;
       let previousSignalSnapshot = null;
+      let notificationWorkerRegistration = null;
+      let notificationWorkerError = null;
+      let pushConfig = null;
+      let pushSubscription = null;
       let alertsEnabled =
+        localStorage.getItem(ALERT_STORAGE_KEY) === "true" ||
         localStorage.getItem("xauusd.browserAlertsEnabled") === "true";
+
+      function persistAlertPreference(enabled) {
+        alertsEnabled = enabled;
+        localStorage.setItem(ALERT_STORAGE_KEY, String(enabled));
+        localStorage.setItem("xauusd.browserAlertsEnabled", String(enabled));
+      }
 
       function notificationsSupported() {
         return typeof window !== "undefined" && "Notification" in window;
+      }
+
+      function pushAlertsSupported() {
+        return (
+          notificationsSupported() &&
+          typeof navigator !== "undefined" &&
+          "serviceWorker" in navigator &&
+          "PushManager" in window &&
+          window.isSecureContext
+        );
+      }
+
+      function canUsePushAlerts() {
+        return Boolean(
+          pushAlertsSupported() && pushConfig && pushConfig.pushAvailable,
+        );
+      }
+
+      function usingPushAlerts() {
+        return Boolean(
+          alertsEnabled &&
+          pushSubscription &&
+          notificationsSupported() &&
+          Notification.permission === "granted",
+        );
+      }
+
+      function liveAlertButtonLabel() {
+        return notificationsSupported()
+          ? alertsEnabled
+            ? "Pause Live Alerts"
+            : "Enable Live Alerts"
+          : alertsEnabled
+            ? "Pause In-App Alerts"
+            : "Enable In-App Alerts";
+      }
+
+      function liveAlertStateText() {
+        if (alertsEnabled) {
+          return notificationsSupported()
+            ? "Live alerts are active on this browser. Important signal changes will still appear while the app is open."
+            : "In-app alerts are active on this device. Important signal changes will appear while the app is open.";
+        }
+
+        return notificationsSupported()
+          ? "This browser can still show live signal alerts while the app is open, even if background push is unavailable."
+          : "This device will use in-app signal alerts while the app is open.";
+      }
+
+      function summarizedPushWarning() {
+        if (!pushConfig || !pushConfig.warning) {
+          return "";
+        }
+
+        if (pushConfig.warning.includes("Server-generated push keys")) {
+          return "Stable WEB_PUSH_VAPID keys will keep subscriptions across redeploys.";
+        }
+
+        return pushConfig.warning;
       }
 
       function isActionableState(actionState) {
@@ -552,12 +735,7 @@
           score: score,
           signals: signals,
           signalsKey: normalizedSignals.join("|"),
-          blockersKey: blockers.join("|"),
           hasBlockers: blockers.length > 0,
-          currentPrice: data.currentPrice || null,
-          entryPrice: data.entryPrice || null,
-          timestamp: data.lastUpdate || data.timestamp || null,
-          summaryLine: `${data.verdict || "Neutral"} · ${Math.round(confidence)}% · ${data.actionState || "WAIT"}`,
         };
       }
 
@@ -652,74 +830,155 @@
         }, 5000);
       }
 
-      function updateNotificationControls() {
-        const button = document.getElementById("notificationToggle");
-        const state = document.getElementById("notificationState");
-        if (!button || !state) {
-          return;
-        }
+      function urlBase64ToUint8Array(value) {
+        const normalized = String(value || "");
+        const padding = "=".repeat((4 - (normalized.length % 4)) % 4);
+        const base64 = (normalized + padding)
+          .replace(/-/g, "+")
+          .replace(/_/g, "/");
+        const rawData = window.atob(base64);
+        return Uint8Array.from(rawData, (character) => character.charCodeAt(0));
+      }
 
-        if (!notificationsSupported()) {
-          button.disabled = true;
-          button.textContent = "Alerts Unavailable";
-          state.textContent = "This browser does not support notifications.";
-          return;
-        }
-
-        if (Notification.permission === "denied") {
-          alertsEnabled = false;
-          localStorage.setItem("xauusd.browserAlertsEnabled", "false");
-          button.disabled = true;
-          button.className = "notification-btn blocked";
-          button.textContent = "Notifications Blocked";
-          state.textContent =
-            "Allow notifications in browser settings to enable alerts.";
-          return;
-        }
-
-        button.disabled = false;
-        if (alertsEnabled && Notification.permission === "granted") {
-          button.className = "notification-btn enabled";
-          button.textContent = "Pause Alerts";
-          state.textContent =
-            "Browser alerts are on for important signal changes.";
-        } else if (Notification.permission === "granted") {
-          button.className = "notification-btn";
-          button.textContent = "Enable Alerts";
-          state.textContent =
-            "Notifications are allowed, but alerts are paused on this device.";
-        } else {
-          button.className = "notification-btn";
-          button.textContent = "Enable Alerts";
-          state.textContent =
-            "Turn on browser alerts for important signal changes.";
+      async function fetchNotificationConfig() {
+        try {
+          const response = await fetch("/api/notifications/config");
+          pushConfig = await response.json();
+        } catch (error) {
+          console.error("Notification config error:", error);
+          pushConfig = {
+            pushAvailable: false,
+            workerPath: "/notification-sw.js",
+            warning: "Could not reach the notification service.",
+          };
+          notificationWorkerError = error;
+        } finally {
+          updateNotificationControls();
         }
       }
 
-      async function toggleAlerts() {
-        if (!notificationsSupported()) {
-          showToast(
-            "Browser notifications are not supported on this device.",
-            "error",
-          );
+      async function registerNotificationWorker() {
+        if (!pushAlertsSupported()) {
+          updateNotificationControls();
+          return null;
+        }
+
+        if (notificationWorkerRegistration) {
+          pushSubscription =
+            await notificationWorkerRegistration.pushManager.getSubscription();
+          return notificationWorkerRegistration;
+        }
+
+        try {
+          notificationWorkerRegistration =
+            await navigator.serviceWorker.register(
+              (pushConfig && pushConfig.workerPath) || "/notification-sw.js",
+              { scope: "/" },
+            );
+          await navigator.serviceWorker.ready;
+          notificationWorkerRegistration =
+            (await navigator.serviceWorker.getRegistration("/")) ||
+            notificationWorkerRegistration;
+          pushSubscription =
+            await notificationWorkerRegistration.pushManager.getSubscription();
+          notificationWorkerError = null;
+        } catch (error) {
+          notificationWorkerError = error;
+          console.error("Service worker registration failed:", error);
+        } finally {
+          updateNotificationControls();
+        }
+
+        return notificationWorkerRegistration;
+      }
+
+      async function syncSubscriptionWithServer(subscription) {
+        const response = await fetch("/api/notifications/subscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ subscription: subscription }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.error || "Unable to save push subscription.");
+        }
+        return payload;
+      }
+
+      async function removeSubscriptionFromServer(endpoint) {
+        if (!endpoint) {
           return;
         }
 
-        if (alertsEnabled && Notification.permission === "granted") {
-          alertsEnabled = false;
-          localStorage.setItem("xauusd.browserAlertsEnabled", "false");
-          updateNotificationControls();
-          showToast("Browser alerts paused for this device.", "info");
-          return;
+        await fetch("/api/notifications/unsubscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ endpoint: endpoint }),
+        }).catch((error) => {
+          console.error("Push unsubscribe sync failed:", error);
+        });
+      }
+
+      async function ensurePushSubscription() {
+        if (
+          !pushConfig ||
+          !pushConfig.pushAvailable ||
+          !pushConfig.vapidPublicKey
+        ) {
+          throw new Error(
+            pushConfig && pushConfig.warning
+              ? pushConfig.warning
+              : "Background push is not configured on the server yet.",
+          );
         }
 
-        if (Notification.permission === "denied") {
+        if (Notification.permission !== "granted") {
+          throw new Error(
+            "Notification permission is required for push alerts.",
+          );
+        }
+
+        const registration = await registerNotificationWorker();
+        if (!registration) {
+          throw new Error(
+            "The background alert worker could not be initialized.",
+          );
+        }
+
+        pushSubscription = await registration.pushManager.getSubscription();
+        if (!pushSubscription) {
+          pushSubscription = await registration.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: urlBase64ToUint8Array(
+              pushConfig.vapidPublicKey,
+            ),
+          });
+        }
+
+        const serializedSubscription = pushSubscription.toJSON
+          ? pushSubscription.toJSON()
+          : pushSubscription;
+        await syncSubscriptionWithServer(serializedSubscription);
+        return pushSubscription;
+      }
+
+      async function enablePushAlerts(showConfirmation = true) {
+        if (!pushAlertsSupported()) {
+          return false;
+        }
+
+        if (!pushConfig) {
+          await fetchNotificationConfig();
+        }
+
+        if (!pushConfig || !pushConfig.pushAvailable) {
           updateNotificationControls();
           showToast(
-            "Notifications are blocked in this browser. Update site permissions to enable alerts.",
-            "error",
+            (pushConfig && pushConfig.warning) ||
+              "Background push is not configured on the server yet.",
+            "warn",
           );
-          return;
+          return false;
         }
 
         let permission = Notification.permission;
@@ -727,48 +986,163 @@
           permission = await Notification.requestPermission();
         }
 
-        alertsEnabled = permission === "granted";
-        localStorage.setItem(
-          "xauusd.browserAlertsEnabled",
-          String(alertsEnabled),
-        );
+        if (permission !== "granted") {
+          persistAlertPreference(false);
+          updateNotificationControls();
+          showToast("Notification permission was not granted.", "warn");
+          return false;
+        }
+
+        await ensurePushSubscription();
+        persistAlertPreference(true);
         updateNotificationControls();
 
-        if (alertsEnabled) {
+        if (showConfirmation) {
           showToast(
-            "Browser alerts enabled. You will be notified when important signals change.",
+            "Push alerts enabled. Important signal changes can now reach this device even after you close the page.",
             "success",
           );
-        } else {
-          showToast("Notification permission was not granted.", "warn");
+        }
+
+        return true;
+      }
+
+      async function disablePushAlerts(showConfirmation = true) {
+        if (notificationWorkerRegistration) {
+          pushSubscription =
+            await notificationWorkerRegistration.pushManager.getSubscription();
+        }
+
+        const endpoint = pushSubscription ? pushSubscription.endpoint : null;
+        if (pushSubscription) {
+          try {
+            await pushSubscription.unsubscribe();
+          } catch (error) {
+            console.error("Push unsubscribe failed:", error);
+          }
+        }
+
+        pushSubscription = null;
+        persistAlertPreference(false);
+        updateNotificationControls();
+        await removeSubscriptionFromServer(endpoint);
+
+        if (showConfirmation) {
+          showToast("Push alerts paused for this device.", "info");
         }
       }
 
-      function sendBrowserNotification(title, body, severity) {
-        if (
-          !alertsEnabled ||
-          !notificationsSupported() ||
-          Notification.permission !== "granted"
-        ) {
-          return;
-        }
-        if (document.visibilityState === "visible") {
+      function updateNotificationControls() {
+        const button = document.getElementById("notificationToggle");
+        const state = document.getElementById("notificationState");
+        if (!button || !state) {
           return;
         }
 
+        const pushSupported = pushAlertsSupported();
+        const pushAvailable = canUsePushAlerts();
+        const permissionDenied =
+          notificationsSupported() && Notification.permission === "denied";
+
+        if (!pushSupported || !pushAvailable || permissionDenied) {
+          button.disabled = false;
+          button.className = alertsEnabled
+            ? "notification-btn enabled"
+            : "notification-btn";
+          button.textContent = liveAlertButtonLabel();
+
+          if (permissionDenied) {
+            state.textContent = alertsEnabled
+              ? "System notifications are blocked, but live in-app signal alerts are active while the app is open."
+              : "System notifications are blocked on this browser. You can still enable live in-app signal alerts while the app is open.";
+            return;
+          }
+
+          if (pushSupported && pushConfig && !pushConfig.pushAvailable) {
+            const compactWarning = summarizedPushWarning();
+            state.textContent = alertsEnabled
+              ? `${liveAlertStateText()} ${compactWarning}`.trim()
+              : compactWarning || liveAlertStateText();
+            return;
+          }
+
+          state.textContent = liveAlertStateText();
+          return;
+        }
+
+        if (!pushConfig) {
+          button.disabled = true;
+          button.className = "notification-btn";
+          button.textContent = "Checking Push...";
+          state.textContent = "Checking background push availability...";
+          return;
+        }
+
+        button.disabled = false;
+        if (usingPushAlerts()) {
+          button.className = "notification-btn enabled";
+          button.textContent = "Pause Push Alerts";
+          state.textContent =
+            "Push alerts are active. Important signal changes can reach this device even after you close the page.";
+          return;
+        }
+
+        button.className = "notification-btn";
+        button.textContent = "Enable Push Alerts";
+        if (notificationWorkerError) {
+          state.textContent =
+            "Push alerts are available, but the background worker failed to initialize on this device.";
+          return;
+        }
+        if (Notification.permission === "granted") {
+          const compactWarning = summarizedPushWarning();
+          state.textContent = compactWarning
+            ? `Push is ready. ${compactWarning}`
+            : "Push is ready, but alerts are paused on this device.";
+          return;
+        }
+        state.textContent =
+          "Enable push alerts once and this device can keep receiving important signal changes after the page is closed.";
+      }
+
+      async function toggleAlerts() {
         try {
-          const notification = new Notification(title, {
-            body: body,
-            tag: "xauusd-important-signal",
-            renotify: true,
-            requireInteraction: severity === "success",
-          });
-          notification.onclick = () => {
-            window.focus();
-            notification.close();
-          };
+          if (alertsEnabled) {
+            if (pushSubscription) {
+              await disablePushAlerts();
+              return;
+            }
+
+            persistAlertPreference(false);
+            updateNotificationControls();
+            showToast("Live signal alerts paused for this device.", "info");
+            return;
+          }
+
+          if (canUsePushAlerts() && Notification.permission !== "denied") {
+            const pushEnabled = await enablePushAlerts();
+            if (pushEnabled) {
+              return;
+            }
+          }
+
+          persistAlertPreference(true);
+          updateNotificationControls();
+          showToast(
+            notificationsSupported()
+              ? "Live signal alerts enabled for this browser while the app is open."
+              : "In-app signal alerts enabled for this device while the app is open.",
+            "success",
+          );
         } catch (error) {
-          console.error("Notification error:", error);
+          console.error("Push alert toggle failed:", error);
+          showToast(
+            error && error.message
+              ? error.message
+              : "Unable to update push alert settings.",
+            "error",
+          );
+          updateNotificationControls();
         }
       }
 
@@ -789,12 +1163,15 @@
         );
         previousSignalSnapshot = currentSnapshot;
 
-        if (!change) {
+        if (
+          !change ||
+          !alertsEnabled ||
+          document.visibilityState !== "visible"
+        ) {
           return;
         }
 
         showToast(`${change.title}: ${change.body}`, change.severity);
-        sendBrowserNotification(change.title, change.body, change.severity);
       }
 
       async function fetchPrediction() {
@@ -809,11 +1186,9 @@
       }
 
       function updateDashboard(data) {
-        // Hide loading, show content
         document.getElementById("loadingState").style.display = "none";
         document.getElementById("mainContent").style.display = "block";
 
-        // Update status
         const statusBadge = document.getElementById("statusBadge");
         if (data.error) {
           statusBadge.className = "status-badge status-error";
@@ -826,7 +1201,6 @@
           statusBadge.textContent = "Live";
         }
 
-        // Update prices
         document.getElementById("currentPrice").textContent = data.currentPrice
           ? "$" + data.currentPrice.toLocaleString()
           : "--";
@@ -837,7 +1211,6 @@
           ? new Date(data.timestamp).toLocaleTimeString()
           : "--";
 
-        // Update verdict
         const verdictEl = document.getElementById("verdictText");
         verdictEl.textContent = data.verdict || "Neutral";
         verdictEl.className =
@@ -848,7 +1221,6 @@
               ? "verdict-bearish"
               : "verdict-neutral");
 
-        // Update confidence ring
         const confidence = data.confidence || 50;
         const ringEl = document.getElementById("confidenceRing");
         const ringColor =
@@ -865,7 +1237,6 @@
         document.getElementById("confidenceValue").textContent =
           confidence + "%";
 
-        // Update stats
         document.getElementById("tradeabilityScore").textContent =
           data.tradeabilityLabel || "Low";
         document.getElementById("scoreValue").textContent = data.forecast
@@ -873,15 +1244,19 @@
           : "--";
         document.getElementById("rrValue").textContent = data.rrRatio || "--";
 
-        // Update signals
         const signalList = document.getElementById("signalList");
         if (data.signals && data.signals.length > 0) {
           signalList.innerHTML = data.signals
-            .map((s) => {
-              const isBullish = s.toLowerCase().includes("bullish");
-              const isBearish = s.toLowerCase().includes("bearish");
-              const cls = isBullish ? "bullish" : isBearish ? "bearish" : "";
-              return `<li class="signal-item ${cls}">${s}</li>`;
+            .map((signal) => {
+              const lowerSignal = signal.toLowerCase();
+              const isBullish = lowerSignal.includes("bullish");
+              const isBearish = lowerSignal.includes("bearish");
+              const signalClass = isBullish
+                ? "bullish"
+                : isBearish
+                  ? "bearish"
+                  : "";
+              return `<li class="signal-item ${signalClass}">${signal}</li>`;
             })
             .join("");
         } else {
@@ -889,24 +1264,21 @@
             '<li class="signal-item">No active signals</li>';
         }
 
-        // Update risk management
         document.getElementById("slValue").textContent = data.stopLoss || "--";
         document.getElementById("tpValue").textContent =
           data.takeProfit || "--";
         document.getElementById("pipValue").textContent = data.tpPips || "--";
 
-        // Update blockers
         const blockersSection = document.getElementById("blockersSection");
         if (data.blockers && data.blockers.length > 0) {
           blockersSection.style.display = "block";
           document.getElementById("blockerList").innerHTML = data.blockers
-            .map((b) => `<li class="blocker-item">⚠️ ${b}</li>`)
+            .map((blocker) => `<li class="blocker-item">⚠️ ${blocker}</li>`)
             .join("");
         } else {
           blockersSection.style.display = "none";
         }
 
-        // Update trade button
         const tradeBtn = document.getElementById("tradeBtn");
         if (data.action === "buy") {
           tradeBtn.textContent = "🚀 ENTER LONG";
@@ -922,7 +1294,6 @@
           tradeBtn.disabled = true;
         }
 
-        // Update chart
         if (data.chartData) {
           updateChart(data.chartData, data.verdict);
         }
@@ -937,8 +1308,8 @@
           priceChart.destroy();
         }
 
-        const labels = chartData.timestamps.map((t) =>
-          new Date(t).toLocaleTimeString(),
+        const labels = chartData.timestamps.map((timestamp) =>
+          new Date(timestamp).toLocaleTimeString(),
         );
         const borderColor =
           verdict === "Bullish"
@@ -1018,13 +1389,42 @@
           `<div style="color: #ff4444;">❌ ${message}</div>`;
       }
 
-      // Initialize
+      async function bootstrapNotifications() {
+        await fetchNotificationConfig();
+        await registerNotificationWorker();
+
+        if (!alertsEnabled && pushSubscription) {
+          await disablePushAlerts(false);
+          return;
+        }
+
+        if (
+          alertsEnabled &&
+          notificationsSupported() &&
+          Notification.permission === "granted" &&
+          canUsePushAlerts()
+        ) {
+          try {
+            await ensurePushSubscription();
+          } catch (error) {
+            console.error("Push alert bootstrap failed:", error);
+            persistAlertPreference(false);
+            showToast(
+              "Push alerts need to be re-enabled on this device before the next background alert can be delivered.",
+              "warn",
+            );
+          }
+        }
+
+        updateNotificationControls();
+      }
+
       document
         .getElementById("notificationToggle")
         .addEventListener("click", toggleAlerts);
-      updateNotificationControls();
+      bootstrapNotifications();
       fetchPrediction();
-      refreshInterval = setInterval(fetchPrediction, 30000); // Refresh every 30s
+      refreshInterval = setInterval(fetchPrediction, 30000);
     </script>
   </body>
 </html>

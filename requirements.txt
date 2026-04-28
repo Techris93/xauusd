@@ -6,3 +6,4 @@ apscheduler>=3.10.0
 gunicorn>=21.2.0
 python-dotenv>=1.0.1
 twelvedata>=1.2.25
+pywebpush>=1.14.0

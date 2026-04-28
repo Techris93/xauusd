@@ -1,7 +1,9 @@
 import math
 import os
 import sys
+import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -23,12 +25,14 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.latest_prediction = None
         app_module.last_update = None
         app_module.error_state = None
+        app_module.last_push_snapshot = None
         self.client = app_module.app.test_client()
 
     def tearDown(self):
         app_module.latest_prediction = None
         app_module.last_update = None
         app_module.error_state = None
+        app_module.last_push_snapshot = None
 
     @staticmethod
     def build_frame(index=None, volume=1000.0):
@@ -106,6 +110,118 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(len(chart_data.get("prices", [])), 50)
         self.assertEqual(len(chart_data.get("timestamps", [])), 50)
         self.assertFalse(any(value is None for value in chart_data.get("vwap", [])))
+
+    def test_prediction_endpoint_refreshes_stale_cache_on_request(self):
+        stale_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+        fresh_time = datetime.now(timezone.utc)
+        fresh_iso = fresh_time.isoformat()
+
+        app_module.latest_prediction = {
+            "verdict": "Bearish",
+            "confidence": 88,
+            "timestamp": stale_time.isoformat(),
+            "lastUpdate": stale_time.isoformat(),
+            "dataSource": "Twelve Data",
+            "symbol": app_module.DEFAULT_SYMBOL,
+        }
+        app_module.last_update = stale_time
+        app_module.error_state = None
+
+        def fake_generate_prediction():
+            app_module.latest_prediction = {
+                "verdict": "Bullish",
+                "confidence": 91,
+                "timestamp": fresh_iso,
+                "lastUpdate": fresh_iso,
+                "dataSource": "Twelve Data",
+                "symbol": app_module.DEFAULT_SYMBOL,
+            }
+            app_module.last_update = fresh_time
+            app_module.error_state = None
+
+        with mock.patch.object(app_module, "generate_prediction", side_effect=fake_generate_prediction) as mocked_generate:
+            response = self.client.get("/api/prediction")
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload.get("status"), "active")
+        self.assertEqual(payload.get("timestamp"), fresh_iso)
+        self.assertEqual(payload.get("verdict"), "Bullish")
+        mocked_generate.assert_called_once()
+
+    def test_notification_service_worker_route_is_available(self):
+        response = self.client.get("/notification-sw.js")
+        response_body = response.get_data(as_text=True)
+        response.close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("application/javascript", response.content_type)
+        self.assertIn('self.addEventListener("push"', response_body)
+        self.assertIn(
+            'self.addEventListener("notificationclick"',
+            response_body,
+        )
+
+    def test_notification_config_route_returns_metadata(self):
+        response = self.client.get("/api/notifications/config")
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("pushAvailable", payload)
+        self.assertEqual(payload.get("workerPath"), "/notification-sw.js")
+        if payload.get("pushAvailable"):
+            self.assertTrue(payload.get("vapidPublicKey"))
+
+    def test_notification_subscription_routes_roundtrip(self):
+        sample_subscription = {
+            "endpoint": "https://example.com/subscriptions/device-1",
+            "expirationTime": None,
+            "keys": {
+                "p256dh": "sample-p256dh-key",
+                "auth": "sample-auth-key",
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            subscriptions_path = str(Path(temp_dir) / "push_subscriptions.json")
+            push_config = {
+                "available": True,
+                "workerPath": "/notification-sw.js",
+                "vapidPublicKey": "sample-public-key",
+                "subject": "mailto:test@example.com",
+                "privateKeyPath": str(Path(temp_dir) / "test-private.pem"),
+            }
+
+            with mock.patch.object(
+                app_module,
+                "WEB_PUSH_SUBSCRIPTIONS_PATH",
+                subscriptions_path,
+            ):
+                with mock.patch.object(
+                    app_module,
+                    "get_web_push_config",
+                    return_value=push_config,
+                ):
+                    subscribe_response = self.client.post(
+                        "/api/notifications/subscribe",
+                        json={"subscription": sample_subscription},
+                    )
+                    duplicate_response = self.client.post(
+                        "/api/notifications/subscribe",
+                        json={"subscription": sample_subscription},
+                    )
+                    unsubscribe_response = self.client.post(
+                        "/api/notifications/unsubscribe",
+                        json={"endpoint": sample_subscription["endpoint"]},
+                    )
+
+        self.assertEqual(subscribe_response.status_code, 200)
+        self.assertTrue(subscribe_response.get_json().get("ok"))
+        self.assertEqual(subscribe_response.get_json().get("subscriberCount"), 1)
+        self.assertEqual(duplicate_response.status_code, 200)
+        self.assertEqual(duplicate_response.get_json().get("subscriberCount"), 1)
+        self.assertEqual(unsubscribe_response.status_code, 200)
+        self.assertEqual(unsubscribe_response.get_json().get("subscriberCount"), 0)
 
     def test_health_endpoint_reports_healthy_after_prediction(self):
         frame = self.build_frame(volume=0.0)

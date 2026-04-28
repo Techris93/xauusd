@@ -39,6 +39,20 @@ Recommended:
 - `PREDICTION_REFRESH_MINUTES=5`
 - `TZ=UTC`
 - `PYTHON_VERSION=3.11.11`
+- `WEB_PUSH_SUBJECT=mailto:alerts@example.com`
+- `WEB_PUSH_VAPID_PUBLIC_KEY` and `WEB_PUSH_VAPID_PRIVATE_KEY` for stable push subscriptions across redeploys
+
+## Background Push Alerts
+
+The dashboard now supports true Web Push alerts for important signal changes.
+
+- Open the dashboard once and click `Enable Push Alerts`.
+- After the browser grants permission, the server stores a device subscription and can push alerts even when the page is closed.
+- If `WEB_PUSH_VAPID_*` is not set, the app generates runtime keys automatically. That is enough to get started, but subscriptions may need to be re-enabled after a redeploy.
+
+Browser note:
+
+- Background push depends on browser support for service workers, push, and site notifications.
 
 ## Local Run
 
@@ -46,6 +60,14 @@ Recommended:
 pip install -r requirements.txt
 export TWELVE_DATA_API_KEY=your_key_here
 python app.py
+```
+
+For stable production push alerts, also set:
+
+```bash
+export WEB_PUSH_SUBJECT=mailto:alerts@example.com
+export WEB_PUSH_VAPID_PUBLIC_KEY=your_public_vapid_key
+export WEB_PUSH_VAPID_PRIVATE_KEY=your_private_vapid_key
 ```
 
 ## Render Setup
@@ -90,6 +112,9 @@ PREDICTOR_PERIOD = 5d
 PREDICTION_REFRESH_MINUTES = 5
 TZ = UTC
 PYTHON_VERSION = 3.11.11
+WEB_PUSH_SUBJECT = mailto:alerts@example.com
+WEB_PUSH_VAPID_PUBLIC_KEY = optional but recommended stable public VAPID key
+WEB_PUSH_VAPID_PRIVATE_KEY = optional but recommended stable private VAPID key
 ```
 
 14. Set the health check path to:
@@ -125,6 +150,7 @@ This repo also includes `render.yaml`.
 - `app.py` - standalone Flask app using Twelve Data
 - `signal_engine.py` - streamlined fixed predictor logic
 - `templates/dashboard.html` - dashboard UI
+- `static/notification-sw.js` - service worker for background push delivery
 - `requirements.txt` - Python dependencies
 - `Procfile` - Render-compatible process command
 - `render.yaml` - optional Blueprint config
