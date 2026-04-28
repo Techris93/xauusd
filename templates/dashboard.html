@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gold Predictor - Fixed</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0a0e1a;
+            color: #e0e0e0;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            min-height: 100vh;
+        }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+        /* Header */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            border-bottom: 1px solid #1a2332;
+            margin-bottom: 30px;
+        }
+        .header h1 {
+            font-size: 28px;
+            background: linear-gradient(135deg, #ffd700, #ffed4e);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .status-badge {
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .status-active { background: rgba(0, 255, 136, 0.15); color: #00ff88; border: 1px solid rgba(0, 255, 136, 0.3); }
+        .status-error { background: rgba(255, 68, 68, 0.15); color: #ff4444; border: 1px solid rgba(255, 68, 68, 0.3); }
+        .status-loading { background: rgba(255, 193, 7, 0.15); color: #ffc107; border: 1px solid rgba(255, 193, 7, 0.3); }
+
+        /* Main Grid */
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+        /* Cards */
+        .card {
+            background: #111827;
+            border: 1px solid #1f2937;
+            border-radius: 16px;
+            padding: 24px;
+            transition: all 0.3s ease;
+        }
+        .card:hover { border-color: #374151; }
+        .card-title {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #6b7280;
+            margin-bottom: 12px;
+        }
+
+        /* Verdict Display */
+        .verdict-container {
+            text-align: center;
+            padding: 30px;
+        }
+        .verdict-text {
+            font-size: 48px;
+            font-weight: 800;
+            margin-bottom: 10px;
+        }
+        .verdict-bullish { color: #00ff88; text-shadow: 0 0 20px rgba(0, 255, 136, 0.3); }
+        .verdict-bearish { color: #ff4444; text-shadow: 0 0 20px rgba(255, 68, 68, 0.3); }
+        .verdict-neutral { color: #6b7280; }
+        .confidence-ring {
+            width: 120px;
+            height: 120px;
+            margin: 20px auto;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            font-weight: 700;
+            position: relative;
+        }
+        .confidence-ring::before {
+            content: '';
+            position: absolute;
+            inset: -4px;
+            border-radius: 50%;
+            padding: 4px;
+            background: conic-gradient(var(--ring-color) var(--ring-deg), transparent 0);
+            -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+            mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+            -webkit-mask-composite: xor;
+            mask-composite: exclude;
+        }
+
+        /* Signal List */
+        .signal-list {
+            list-style: none;
+        }
+        .signal-item {
+            padding: 12px;
+            margin-bottom: 8px;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 8px;
+            border-left: 3px solid #ffd700;
+            font-size: 14px;
+        }
+        .signal-item.bullish { border-left-color: #00ff88; }
+        .signal-item.bearish { border-left-color: #ff4444; }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            margin-top: 16px;
+        }
+        .stat-box {
+            background: rgba(255, 255, 255, 0.03);
+            padding: 16px;
+            border-radius: 12px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #ffd700;
+        }
+        .stat-label {
+            font-size: 11px;
+            color: #6b7280;
+            margin-top: 4px;
+        }
+
+        /* Price Info */
+        .price-info {
+            display: flex;
+            justify-content: space-around;
+            padding: 20px;
+            background: rgba(255, 215, 0, 0.05);
+            border-radius: 12px;
+            margin-bottom: 20px;
+        }
+        .price-item {
+            text-align: center;
+        }
+        .price-value {
+            font-size: 28px;
+            font-weight: 700;
+            color: #ffd700;
+        }
+        .price-label {
+            font-size: 12px;
+            color: #6b7280;
+            margin-top: 4px;
+        }
+
+        /* Chart Container */
+        .chart-container {
+            position: relative;
+            height: 400px;
+            margin-top: 20px;
+        }
+
+        /* Blockers */
+        .blocker-list {
+            list-style: none;
+            margin-top: 12px;
+        }
+        .blocker-item {
+            padding: 10px;
+            margin-bottom: 6px;
+            background: rgba(255, 68, 68, 0.1);
+            border-radius: 8px;
+            font-size: 13px;
+            color: #ff8888;
+        }
+
+        /* Loading */
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 200px;
+            font-size: 18px;
+            color: #6b7280;
+        }
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid #1f2937;
+            border-top-color: #ffd700;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 16px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Trade Button */
+        .trade-btn {
+            width: 100%;
+            padding: 16px;
+            border: none;
+            border-radius: 12px;
+            font-size: 18px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-top: 16px;
+        }
+        .trade-btn.buy {
+            background: linear-gradient(135deg, #00ff88, #00cc6a);
+            color: #000;
+        }
+        .trade-btn.sell {
+            background: linear-gradient(135deg, #ff4444, #cc0000);
+            color: #fff;
+        }
+        .trade-btn:disabled {
+            background: #1f2937;
+            color: #6b7280;
+            cursor: not-allowed;
+        }
+        .trade-btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🥇 XAUUSD Predictor</h1>
+            <div id="statusBadge" class="status-badge status-loading">Initializing...</div>
+        </div>
+
+        <div id="loadingState" class="loading">
+            <div class="spinner"></div>
+            Loading prediction data...
+        </div>
+
+        <div id="mainContent" style="display: none;">
+            <!-- Price Info -->
+            <div class="price-info">
+                <div class="price-item">
+                    <div class="price-value" id="currentPrice">--</div>
+                    <div class="price-label">Current Price</div>
+                </div>
+                <div class="price-item">
+                    <div class="price-value" id="signalPrice">--</div>
+                    <div class="price-label">Signal Price</div>
+                </div>
+                <div class="price-item">
+                    <div class="price-value" id="lastUpdate">--</div>
+                    <div class="price-label">Last Update</div>
+                </div>
+            </div>
+
+            <div class="grid">
+                <!-- Verdict Card -->
+                <div class="card">
+                    <div class="card-title">Directional Verdict</div>
+                    <div class="verdict-container">
+                        <div class="verdict-text" id="verdictText">--</div>
+                        <div class="confidence-ring" id="confidenceRing">
+                            <span id="confidenceValue">--</span>
+                        </div>
+                        <div style="color: #6b7280; font-size: 14px;">Confidence</div>
+                    </div>
+
+                    <div class="stats-grid">
+                        <div class="stat-box">
+                            <div class="stat-value" id="tradeabilityScore">--</div>
+                            <div class="stat-label">Tradeability</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-value" id="scoreValue">--</div>
+                            <div class="stat-label">Signal Score</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-value" id="rrValue">--</div>
+                            <div class="stat-label">R:R Ratio</div>
+                        </div>
+                    </div>
+
+                    <button id="tradeBtn" class="trade-btn" disabled>Waiting for Signal...</button>
+                </div>
+
+                <!-- Details Card -->
+                <div class="card">
+                    <div class="card-title">Signal Analysis</div>
+                    <ul class="signal-list" id="signalList">
+                        <li class="signal-item">Loading signals...</li>
+                    </ul>
+
+                    <div style="margin-top: 20px;">
+                        <div class="card-title">Risk Management</div>
+                        <div class="stats-grid">
+                            <div class="stat-box">
+                                <div class="stat-value" id="slValue">--</div>
+                                <div class="stat-label">Stop Loss</div>
+                            </div>
+                            <div class="stat-box">
+                                <div class="stat-value" id="tpValue">--</div>
+                                <div class="stat-label">Take Profit</div>
+                            </div>
+                            <div class="stat-box">
+                                <div class="stat-value" id="pipValue">--</div>
+                                <div class="stat-label">Target Pips</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="blockersSection" style="margin-top: 20px; display: none;">
+                        <div class="card-title" style="color: #ff4444;">Blockers</div>
+                        <ul class="blocker-list" id="blockerList"></ul>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Chart -->
+            <div class="card">
+                <div class="card-title">Price Action & Signals</div>
+                <div class="chart-container">
+                    <canvas id="priceChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let priceChart = null;
+        let refreshInterval = null;
+
+        async function fetchPrediction() {
+            try {
+                const response = await fetch('/api/prediction');
+                const data = await response.json();
+                updateDashboard(data);
+            } catch (error) {
+                console.error('Fetch error:', error);
+                showError('Failed to fetch prediction data');
+            }
+        }
+
+        function updateDashboard(data) {
+            // Hide loading, show content
+            document.getElementById('loadingState').style.display = 'none';
+            document.getElementById('mainContent').style.display = 'block';
+
+            // Update status
+            const statusBadge = document.getElementById('statusBadge');
+            if (data.error) {
+                statusBadge.className = 'status-badge status-error';
+                statusBadge.textContent = 'Error';
+            } else if (data.status === 'initializing') {
+                statusBadge.className = 'status-badge status-loading';
+                statusBadge.textContent = 'Initializing...';
+            } else {
+                statusBadge.className = 'status-badge status-active';
+                statusBadge.textContent = 'Live';
+            }
+
+            // Update prices
+            document.getElementById('currentPrice').textContent = 
+                data.currentPrice ? '$' + data.currentPrice.toLocaleString() : '--';
+            document.getElementById('signalPrice').textContent = 
+                data.entryPrice ? '$' + data.entryPrice.toLocaleString() : '--';
+            document.getElementById('lastUpdate').textContent = 
+                data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : '--';
+
+            // Update verdict
+            const verdictEl = document.getElementById('verdictText');
+            verdictEl.textContent = data.verdict || 'Neutral';
+            verdictEl.className = 'verdict-text ' + 
+                (data.verdict === 'Bullish' ? 'verdict-bullish' : 
+                 data.verdict === 'Bearish' ? 'verdict-bearish' : 'verdict-neutral');
+
+            // Update confidence ring
+            const confidence = data.confidence || 50;
+            const ringEl = document.getElementById('confidenceRing');
+            const ringColor = data.verdict === 'Bullish' ? '#00ff88' : 
+                             data.verdict === 'Bearish' ? '#ff4444' : '#6b7280';
+            ringEl.style.setProperty('--ring-color', ringColor);
+            ringEl.style.setProperty('--ring-deg', (confidence / 100 * 360) + 'deg');
+            document.getElementById('confidenceValue').textContent = confidence + '%';
+
+            // Update stats
+            document.getElementById('tradeabilityScore').textContent = 
+                data.tradeabilityLabel || 'Low';
+            document.getElementById('scoreValue').textContent = 
+                data.forecast ? data.forecast.score : '--';
+            document.getElementById('rrValue').textContent = data.rrRatio || '--';
+
+            // Update signals
+            const signalList = document.getElementById('signalList');
+            if (data.signals && data.signals.length > 0) {
+                signalList.innerHTML = data.signals.map(s => {
+                    const isBullish = s.toLowerCase().includes('bullish');
+                    const isBearish = s.toLowerCase().includes('bearish');
+                    const cls = isBullish ? 'bullish' : isBearish ? 'bearish' : '';
+                    return `<li class="signal-item ${cls}">${s}</li>`;
+                }).join('');
+            } else {
+                signalList.innerHTML = '<li class="signal-item">No active signals</li>';
+            }
+
+            // Update risk management
+            document.getElementById('slValue').textContent = data.stopLoss || '--';
+            document.getElementById('tpValue').textContent = data.takeProfit || '--';
+            document.getElementById('pipValue').textContent = data.tpPips || '--';
+
+            // Update blockers
+            const blockersSection = document.getElementById('blockersSection');
+            if (data.blockers && data.blockers.length > 0) {
+                blockersSection.style.display = 'block';
+                document.getElementById('blockerList').innerHTML = 
+                    data.blockers.map(b => `<li class="blocker-item">⚠️ ${b}</li>`).join('');
+            } else {
+                blockersSection.style.display = 'none';
+            }
+
+            // Update trade button
+            const tradeBtn = document.getElementById('tradeBtn');
+            if (data.action === 'buy') {
+                tradeBtn.textContent = '🚀 ENTER LONG';
+                tradeBtn.className = 'trade-btn buy';
+                tradeBtn.disabled = false;
+            } else if (data.action === 'sell') {
+                tradeBtn.textContent = '🔻 ENTER SHORT';
+                tradeBtn.className = 'trade-btn sell';
+                tradeBtn.disabled = false;
+            } else {
+                tradeBtn.textContent = 'Waiting for Signal...';
+                tradeBtn.className = 'trade-btn';
+                tradeBtn.disabled = true;
+            }
+
+            // Update chart
+            if (data.chartData) {
+                updateChart(data.chartData, data.verdict);
+            }
+        }
+
+        function updateChart(chartData, verdict) {
+            const ctx = document.getElementById('priceChart').getContext('2d');
+
+            if (priceChart) {
+                priceChart.destroy();
+            }
+
+            const labels = chartData.timestamps.map(t => new Date(t).toLocaleTimeString());
+            const borderColor = verdict === 'Bullish' ? '#00ff88' : 
+                               verdict === 'Bearish' ? '#ff4444' : '#ffd700';
+
+            priceChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [
+                        {
+                            label: 'Price',
+                            data: chartData.prices,
+                            borderColor: borderColor,
+                            backgroundColor: borderColor + '20',
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.4,
+                            pointRadius: 0
+                        },
+                        {
+                            label: 'EMA 20',
+                            data: chartData.ema20,
+                            borderColor: '#3b82f6',
+                            borderWidth: 1,
+                            pointRadius: 0,
+                            borderDash: [5, 5]
+                        },
+                        {
+                            label: 'EMA 50',
+                            data: chartData.ema50,
+                            borderColor: '#8b5cf6',
+                            borderWidth: 1,
+                            pointRadius: 0,
+                            borderDash: [5, 5]
+                        },
+                        {
+                            label: 'VWAP',
+                            data: chartData.vwap,
+                            borderColor: '#f59e0b',
+                            borderWidth: 1,
+                            pointRadius: 0
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        intersect: false,
+                        mode: 'index'
+                    },
+                    plugins: {
+                        legend: {
+                            labels: { color: '#6b7280' }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: { color: '#1f2937' },
+                            ticks: { color: '#6b7280', maxTicksLimit: 8 }
+                        },
+                        y: {
+                            grid: { color: '#1f2937' },
+                            ticks: { color: '#6b7280' }
+                        }
+                    }
+                }
+            });
+        }
+
+        function showError(message) {
+            document.getElementById('loadingState').innerHTML = 
+                `<div style="color: #ff4444;">❌ ${message}</div>`;
+        }
+
+        // Initialize
+        fetchPrediction();
+        refreshInterval = setInterval(fetchPrediction, 30000); // Refresh every 30s
+    </script>
+</body>
+</html>

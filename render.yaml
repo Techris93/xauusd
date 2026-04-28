@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: xauusd-fixed
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --workers 1 --threads 4 --timeout 120 app:app
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: TWELVE_DATA_SYMBOL
+        value: XAU/USD
+      - key: PREDICTOR_INTERVAL
+        value: 1h
+      - key: PREDICTOR_PERIOD
+        value: 5d
+      - key: PREDICTION_REFRESH_MINUTES
+        value: 5
+      - key: TZ
+        value: UTC
