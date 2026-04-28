@@ -8,7 +8,7 @@ import math
 import numpy as np
 import pandas as pd
 import ta
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # ============================================
 # CORE FIX 1: STREAMLINED PARAMETERS
@@ -29,7 +29,14 @@ DEFAULT_PARAMS = {
     "volume_weight": 1.0,
     "sr_weight": 1.8,              # INCREASED - key levels drive moves
     "min_confidence": 55,          # Lowered from 63 - allow earlier signals
+    "min_signal_score": 55,        # Entry score threshold
+    "exit_confidence": 45,         # Exit score/confidence threshold for hysteresis
     "min_tradeability": 45,        # Lowered from 52 - don't block valid setups
+    "exit_tradeability": 35,       # Lower exit threshold keeps active signals sticky
+    "signal_cooldown_minutes": 15, # Minimum time between signal changes
+    "min_hold_bars": 3,            # Opposite evidence must persist before flips
+    "structure_dominance": True,   # Structure breaks dominate single-bar MA noise
+    "max_flips_per_hour": 3,       # Rate-limit signal changes
     "direction_threshold": 1.0,    # Lowered from 1.2 - easier directional trigger
     "session_filter": False,       # DISABLED - don't block Asian session moves
     "anticipate_breaks": True,     # NEW - pre-position at structure
@@ -37,6 +44,153 @@ DEFAULT_PARAMS = {
     "sl_atr_mult": 1.5,
     "tp_atr_mult": 3.0,
 }
+
+
+ACTIVE_SIGNALS = {"LONG_ACTIVE", "SHORT_ACTIVE"}
+
+
+def _signal_for_direction(direction):
+    if direction == "bullish":
+        return "LONG_ACTIVE"
+    if direction == "bearish":
+        return "SHORT_ACTIVE"
+    return "WAIT"
+
+
+def _direction_for_signal(signal):
+    if signal == "LONG_ACTIVE":
+        return "bullish"
+    if signal == "SHORT_ACTIVE":
+        return "bearish"
+    return "neutral"
+
+
+def _verdict_for_signal(signal):
+    if signal == "LONG_ACTIVE":
+        return "Bullish"
+    if signal == "SHORT_ACTIVE":
+        return "Bearish"
+    return "Neutral"
+
+
+def _action_for_signal(signal):
+    if signal == "LONG_ACTIVE":
+        return "buy"
+    if signal == "SHORT_ACTIVE":
+        return "sell"
+    return "hold"
+
+
+def _opposite_direction(direction):
+    if direction == "bullish":
+        return "bearish"
+    if direction == "bearish":
+        return "bullish"
+    return "neutral"
+
+
+def _current_bar_id(df):
+    if df.empty:
+        return 0
+    value = df.index[-1]
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+class SignalState:
+    """Runtime signal memory used to prevent rapid LONG/WAIT flip-flopping."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.reset()
+        return cls._instance
+
+    def reset(self):
+        self.current_signal = "WAIT"
+        self.current_direction = "neutral"
+        self.signal_start_time = None
+        self.signal_start_bar_id = None
+        self.last_flip_time = None
+        self.flip_count = 0
+        self.flip_history = []
+        self.entry_score = 0.0
+        self.entry_confidence = 0
+        self.entry_signals = []
+        self.consecutive_opposite_bars = 0
+        self.last_opposite_bar_id = None
+
+    def is_active(self):
+        return self.current_signal in ACTIVE_SIGNALS
+
+    def hold_time_minutes(self):
+        if self.signal_start_time is None:
+            return None
+        return int((datetime.now(timezone.utc) - self.signal_start_time).total_seconds() / 60)
+
+    def recent_flip_count(self, now=None):
+        now = now or datetime.now(timezone.utc)
+        self.flip_history = [
+            item for item in self.flip_history if now - item < timedelta(hours=24)
+        ]
+        return len([item for item in self.flip_history if now - item < timedelta(hours=1)])
+
+    def record_opposite_bar(self, bar_id):
+        if self.last_opposite_bar_id != bar_id:
+            self.consecutive_opposite_bars += 1
+            self.last_opposite_bar_id = bar_id
+
+    def reset_opposite_bars(self):
+        self.consecutive_opposite_bars = 0
+        self.last_opposite_bar_id = None
+
+    def can_change_signal(self, new_signal, new_direction, params):
+        now = datetime.now(timezone.utc)
+        if new_signal == self.current_signal:
+            return True, "Same signal - updating"
+
+        if self.recent_flip_count(now) >= params["max_flips_per_hour"]:
+            return False, f"Max flips/hour reached: {params['max_flips_per_hour']}"
+
+        if self.last_flip_time:
+            elapsed_minutes = (now - self.last_flip_time).total_seconds() / 60
+            if elapsed_minutes < params["signal_cooldown_minutes"]:
+                remaining = params["signal_cooldown_minutes"] - elapsed_minutes
+                return False, f"Cooldown active: {remaining:.1f}min remaining"
+
+        if (
+            self.is_active()
+            and new_signal in ACTIVE_SIGNALS
+            and new_direction == _opposite_direction(self.current_direction)
+            and self.consecutive_opposite_bars < params["min_hold_bars"]
+        ):
+            return (
+                False,
+                f"Opposite signal needs {params['min_hold_bars']} bars "
+                f"({self.consecutive_opposite_bars}/{params['min_hold_bars']})",
+            )
+
+        return True, "Signal change allowed"
+
+    def update_signal(self, signal, direction, bar_id, score, confidence, signals):
+        if signal != self.current_signal:
+            now = datetime.now(timezone.utc)
+            self.last_flip_time = now
+            self.flip_history.append(now)
+            self.flip_count += 1
+            self.signal_start_time = now if signal in ACTIVE_SIGNALS else None
+            self.signal_start_bar_id = bar_id if signal in ACTIVE_SIGNALS else None
+            self.entry_score = float(score or 0) if signal in ACTIVE_SIGNALS else 0.0
+            self.entry_confidence = confidence if signal in ACTIVE_SIGNALS else 0
+            self.entry_signals = list(signals or []) if signal in ACTIVE_SIGNALS else []
+            self.reset_opposite_bars()
+
+        self.current_signal = signal
+        self.current_direction = direction
+
+
+signal_state = SignalState()
 
 # ============================================
 # CORE FIX 2: STRUCTURE BREAK DETECTION
@@ -153,7 +307,7 @@ def detect_vwap_rejection(df):
 # Pre-position BEFORE the break, not after
 # ============================================
 
-def calculate_anticipatory_score(df, params):
+def calculate_anticipatory_score(df, params, current_bar_id=None):
     """
     Calculate score for entering BEFORE confirmed breakout.
     This is the key fix - the original code waited for confirmation
@@ -162,6 +316,7 @@ def calculate_anticipatory_score(df, params):
     if len(df) < 10:
         return 0, "neutral", []
 
+    current_bar_id = current_bar_id if current_bar_id is not None else _current_bar_id(df)
     current = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -195,17 +350,50 @@ def calculate_anticipatory_score(df, params):
     # 3. MA alignment (trend confirmation)
     ema20 = current.get('EMA_20')
     ema50 = current.get('EMA_50')
+    ma_direction = "neutral"
     if pd.notna(ema20) and pd.notna(ema50):
         if current['Close'] < ema20 < ema50:
-            score += 15
-            if direction == "neutral":
-                direction = "bearish"
-            signals.append("Bearish MA alignment")
+            ma_direction = "bearish"
+            if direction != "bullish" or not params.get("structure_dominance", True):
+                score += 15
+                if direction == "neutral":
+                    direction = "bearish"
+                signals.append("Bearish MA alignment")
+            else:
+                signals.append("Bearish MA alignment suppressed by bullish structure")
         elif current['Close'] > ema20 > ema50:
-            score += 15
-            if direction == "neutral":
-                direction = "bullish"
-            signals.append("Bullish MA alignment")
+            ma_direction = "bullish"
+            if direction != "bearish" or not params.get("structure_dominance", True):
+                score += 15
+                if direction == "neutral":
+                    direction = "bullish"
+                signals.append("Bullish MA alignment")
+            else:
+                signals.append("Bullish MA alignment suppressed by bearish structure")
+
+    active_direction = signal_state.current_direction
+    opposite_direction = _opposite_direction(active_direction)
+    opposite_evidence = (
+        signal_state.is_active()
+        and opposite_direction != "neutral"
+        and (ma_direction == opposite_direction or direction == opposite_direction)
+    )
+    if opposite_evidence:
+        signal_state.record_opposite_bar(current_bar_id)
+        if signal_state.consecutive_opposite_bars < params["min_hold_bars"]:
+            score = max(score, signal_state.entry_score * 0.8, params["exit_confidence"])
+            direction = active_direction
+            signals.append(
+                f"MA {opposite_direction} (holding: "
+                f"{signal_state.consecutive_opposite_bars}/{params['min_hold_bars']} bars)"
+            )
+        else:
+            signals.append(
+                f"MA {opposite_direction} confirmed "
+                f"({signal_state.consecutive_opposite_bars}/{params['min_hold_bars']} bars)"
+            )
+    else:
+        signal_state.reset_opposite_bars()
 
     # 4. ADX momentum (but don't require high threshold)
     adx = current.get('ADX_14', 0)
@@ -264,7 +452,7 @@ def detect_support_resistance_break(current, prev):
 # Original had 50+ penalty terms that killed valid signals
 # ============================================
 
-def calculate_confidence(score, direction, df, params):
+def calculate_confidence(score, direction, df, params, is_exit=False):
     """
     Simple confidence based on score + trend alignment.
     No more death-by-a-thousand-penalties.
@@ -288,10 +476,14 @@ def calculate_confidence(score, direction, df, params):
     # Cap at 95
     confidence = min(base_confidence, 95)
 
-    min_signal_score = params.get('min_signal_score', params['min_confidence'])
+    min_signal_score = params["exit_confidence"] if is_exit else params.get(
+        'min_signal_score',
+        params['min_confidence'],
+    )
+    min_confidence = params["exit_confidence"] if is_exit else params['min_confidence']
 
     # Determine verdict
-    if score >= min_signal_score and confidence >= params['min_confidence']:
+    if score >= min_signal_score and confidence >= min_confidence:
         verdict = "Bullish" if direction == "bullish" else "Bearish"
     else:
         verdict = "Neutral"
@@ -303,7 +495,7 @@ def calculate_confidence(score, direction, df, params):
 # CORE FIX 5: TRADEABILITY WITHOUT DEADLOCK
 # ============================================
 
-def calculate_tradeability(score, direction, df, params):
+def calculate_tradeability(score, direction, df, params, is_exit=False):
     """
     Simple tradeability - if we have a directional signal with decent score,
     it's tradeable. No complex multi-dimensional quality matrices.
@@ -313,35 +505,104 @@ def calculate_tradeability(score, direction, df, params):
 
     tradeability = score * 0.9  # Slight reduction for risk management
 
-    if tradeability >= params['min_tradeability']:
+    threshold = params['exit_tradeability'] if is_exit else params['min_tradeability']
+
+    if tradeability >= threshold:
         label = "High" if tradeability >= 70 else "Medium"
         return tradeability, label, []
     else:
-        return tradeability, "Low", [f"Score {tradeability:.1f} below threshold {params['min_tradeability']}"]
+        return tradeability, "Low", [f"Score {tradeability:.1f} below threshold {threshold}"]
 
 
 # ============================================
 # CORE FIX 6: ENTRY/EXIT LOGIC
 # ============================================
 
-def determine_action(confidence, verdict, tradeability, blockers, params):
+def determine_action(score, direction, confidence, verdict, tradeability, blockers, params, bar_id, signals):
     """
-    Clean action determination - no more WAIT deadlocks.
+    Action determination with hysteresis, cooldown, min-hold bars, and rate limits.
     """
-    if blockers:
-        return "WAIT", "hold", blockers
+    entry_score = params.get('min_signal_score', params['min_confidence'])
+    active_signal = signal_state.current_signal
+    active_direction = signal_state.current_direction
+    is_active = signal_state.is_active()
+    raw_signal = "WAIT"
+    raw_direction = "neutral"
+    raw_blockers = list(blockers or [])
 
-    if verdict == "Neutral":
-        return "WAIT", "hold", ["No directional verdict"]
+    if is_active:
+        same_direction = direction == active_direction
+        opposite = direction == _opposite_direction(active_direction)
 
-    if confidence < params['min_confidence']:
-        return "WAIT", "hold", [f"Confidence {confidence} below {params['min_confidence']}"]
-
-    # Active signal
-    if verdict == "Bullish":
-        return "LONG_ACTIVE", "buy", []
+        if (
+            same_direction
+            and score >= params['exit_confidence']
+            and confidence >= params['exit_confidence']
+            and tradeability >= params['exit_tradeability']
+        ):
+            raw_signal = active_signal
+            raw_direction = active_direction
+            raw_blockers = []
+        elif (
+            opposite
+            and score >= entry_score
+            and confidence >= params['min_confidence']
+            and tradeability >= params['min_tradeability']
+            and not blockers
+        ):
+            raw_signal = _signal_for_direction(direction)
+            raw_direction = direction
+            raw_blockers = []
+        elif (
+            score >= params['exit_confidence']
+            and confidence >= params['exit_confidence']
+            and tradeability >= params['exit_tradeability']
+        ):
+            raw_signal = active_signal
+            raw_direction = active_direction
+            raw_blockers = []
+        else:
+            raw_blockers = raw_blockers or [
+                f"Exit threshold reached: score {score:.1f} below {params['exit_confidence']}"
+            ]
     else:
-        return "SHORT_ACTIVE", "sell", []
+        if blockers:
+            raw_blockers = list(blockers)
+        elif verdict == "Neutral":
+            raw_blockers = ["No directional verdict"]
+        elif confidence < params['min_confidence']:
+            raw_blockers = [f"Confidence {confidence} below {params['min_confidence']}"]
+        elif score < entry_score:
+            raw_blockers = [f"Score {score:.1f} below {entry_score}"]
+        else:
+            raw_signal = _signal_for_direction(direction)
+            raw_direction = direction
+            raw_blockers = []
+
+    allowed, reason = signal_state.can_change_signal(raw_signal, raw_direction, params)
+    if not allowed and is_active:
+        held_signal = active_signal
+        held_direction = active_direction
+        return (
+            held_signal,
+            _action_for_signal(held_signal),
+            [f"Holding: {reason}"],
+            _verdict_for_signal(held_signal),
+            held_direction,
+            True,
+        )
+    if not allowed:
+        return "WAIT", "hold", [reason], "Neutral", "neutral", True
+
+    signal_state.update_signal(raw_signal, raw_direction, bar_id, score, confidence, signals)
+    return (
+        raw_signal,
+        _action_for_signal(raw_signal),
+        raw_blockers,
+        _verdict_for_signal(raw_signal) if raw_signal in ACTIVE_SIGNALS else verdict,
+        raw_direction if raw_signal in ACTIVE_SIGNALS else direction,
+        False,
+    )
 
 
 def calculate_stop_loss_take_profit(current_price, direction, df, params):
@@ -384,24 +645,46 @@ def compute_prediction(df, params=None):
             "action": "hold",
             "actionState": "WAIT",
             "reason": "Insufficient data",
-            "signals": []
+            "signals": [],
+            "signalState": signal_state.current_signal,
+            "holdTimeMinutes": signal_state.hold_time_minutes(),
+            "flipsToday": signal_state.flip_count,
         }
 
     current_price = df['Close'].iloc[-1]
+    bar_id = _current_bar_id(df)
+    is_exit_check = signal_state.is_active()
 
     # Calculate anticipatory score (THE FIX)
-    score, direction, signals = calculate_anticipatory_score(df, params)
+    score, direction, signals = calculate_anticipatory_score(df, params, bar_id)
 
-    # Calculate confidence
-    confidence, verdict = calculate_confidence(score, direction, df, params)
+    # Calculate confidence with hysteresis
+    confidence, verdict = calculate_confidence(score, direction, df, params, is_exit_check)
 
-    # Calculate tradeability
-    tradeability, tradeability_label, blockers = calculate_tradeability(score, direction, df, params)
-
-    # Determine action
-    action_state, action, final_blockers = determine_action(
-        confidence, verdict, tradeability, blockers, params
+    # Calculate tradeability with hysteresis
+    tradeability, tradeability_label, blockers = calculate_tradeability(
+        score,
+        direction,
+        df,
+        params,
+        is_exit_check,
     )
+
+    # Determine action with anti-flip guards
+    action_state, action, final_blockers, effective_verdict, effective_direction, held = determine_action(
+        score,
+        direction,
+        confidence,
+        verdict,
+        tradeability,
+        blockers,
+        params,
+        bar_id,
+        signals,
+    )
+    if held:
+        verdict = effective_verdict
+        direction = effective_direction
 
     # Calculate SL/TP if active
     sl = tp = sl_pips = tp_pips = None
@@ -435,7 +718,14 @@ def compute_prediction(df, params=None):
         "rrRatio": round(params['tp_atr_mult'] / params['sl_atr_mult'], 2),
         "forecast": forecast,
         "signals": signals,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "signalState": signal_state.current_signal,
+        "holdTimeMinutes": signal_state.hold_time_minutes(),
+        "flipsToday": signal_state.flip_count,
+        "cooldownMinutes": params['signal_cooldown_minutes'],
+        "minHoldBars": params['min_hold_bars'],
+        "oppositeBars": signal_state.consecutive_opposite_bars,
+        "antiFlipReason": final_blockers[0] if held and final_blockers else None,
     }
 
 

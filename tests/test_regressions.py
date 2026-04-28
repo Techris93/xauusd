@@ -17,11 +17,13 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("DISABLE_PREDICTION_SCHEDULER", "1")
 
 import app as app_module
+import signal_engine as signal_module
 from signal_engine import (
     calculate_anticipatory_score,
     calculate_confidence,
     detect_structure_break,
     prepare_data,
+    signal_state,
 )
 
 
@@ -31,7 +33,9 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.last_update = None
         app_module.error_state = None
         app_module.last_push_snapshot = None
+        app_module.last_notification = {"key": None, "time": None}
         app_module.get_web_push_config.cache_clear()
+        signal_state.reset()
         self.client = app_module.app.test_client()
 
     def tearDown(self):
@@ -39,7 +43,9 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.last_update = None
         app_module.error_state = None
         app_module.last_push_snapshot = None
+        app_module.last_notification = {"key": None, "time": None}
         app_module.get_web_push_config.cache_clear()
+        signal_state.reset()
 
     @staticmethod
     def build_frame(index=None, volume=1000.0):
@@ -67,6 +73,37 @@ class PredictorRegressionTests(unittest.TestCase):
 
         frame = pd.DataFrame(rows, index=index)
         frame.index.name = "Datetime"
+        return frame
+
+    @staticmethod
+    def build_signal_frame():
+        index = pd.date_range(
+            start=pd.Timestamp("2024-01-01T00:00:00Z"),
+            periods=30,
+            freq="h",
+            tz="UTC",
+        )
+        close = [100.0 + offset * 0.1 for offset in range(len(index))]
+        frame = pd.DataFrame(
+            {
+                "Open": close,
+                "High": [value + 0.3 for value in close],
+                "Low": [value - 0.3 for value in close],
+                "Close": close,
+                "Volume": [1000.0] * len(index),
+                "EMA_20": [value - 0.5 for value in close],
+                "EMA_50": [value - 1.0 for value in close],
+                "VWAP": [value - 0.2 for value in close],
+                "ADX_14": [25.0] * len(index),
+                "ATR_14": [1.0] * len(index),
+                "VOLUME_SPIKE": [0] * len(index),
+                "RECENT_SWING_LOW": [value - 2.0 for value in close],
+                "RECENT_SWING_HIGH": [value + 2.0 for value in close],
+            },
+            index=index,
+        )
+        frame["nearest_support"] = [{"label": "Round Number", "price": 99.0}] * len(frame)
+        frame["nearest_resistance"] = [{"label": "Round Number", "price": 105.0}] * len(frame)
         return frame
 
     def test_prepare_data_assigns_nearest_levels_without_existing_columns(self):
@@ -184,6 +221,58 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIn("Breaking key support", signals)
         self.assertGreaterEqual(score, 25)
 
+    def test_signal_hysteresis_keeps_active_signal_above_exit_score(self):
+        frame = self.build_signal_frame()
+
+        with mock.patch.object(
+            signal_module,
+            "calculate_anticipatory_score",
+            side_effect=[
+                (80, "bullish", ["Bullish structure break"]),
+                (50, "bullish", ["Bullish structure cooling"]),
+            ],
+        ):
+            first_prediction = signal_module.compute_prediction(frame, app_module.DEFAULT_PARAMS)
+            second_prediction = signal_module.compute_prediction(frame, app_module.DEFAULT_PARAMS)
+
+        self.assertEqual(first_prediction["actionState"], "LONG_ACTIVE")
+        self.assertEqual(second_prediction["actionState"], "LONG_ACTIVE")
+        self.assertEqual(second_prediction["verdict"], "Bullish")
+        self.assertIsNone(second_prediction["antiFlipReason"])
+
+    def test_signal_cooldown_blocks_immediate_opposite_flip(self):
+        frame = self.build_signal_frame()
+
+        with mock.patch.object(
+            signal_module,
+            "calculate_anticipatory_score",
+            side_effect=[
+                (80, "bullish", ["Bullish structure break"]),
+                (80, "bearish", ["Bearish MA alignment"]),
+            ],
+        ):
+            first_prediction = signal_module.compute_prediction(frame, app_module.DEFAULT_PARAMS)
+            second_prediction = signal_module.compute_prediction(frame, app_module.DEFAULT_PARAMS)
+
+        self.assertEqual(first_prediction["actionState"], "LONG_ACTIVE")
+        self.assertEqual(second_prediction["actionState"], "LONG_ACTIVE")
+        self.assertIn("Cooldown active", second_prediction["antiFlipReason"])
+
+    def test_min_hold_requires_confirmed_opposite_bars(self):
+        params = app_module.DEFAULT_PARAMS
+        signal_state.current_signal = "LONG_ACTIVE"
+        signal_state.current_direction = "bullish"
+        signal_state.last_flip_time = datetime.now(timezone.utc) - timedelta(minutes=16)
+        signal_state.consecutive_opposite_bars = params["min_hold_bars"] - 1
+
+        allowed, reason = signal_state.can_change_signal("SHORT_ACTIVE", "bearish", params)
+        self.assertFalse(allowed)
+        self.assertIn("Opposite signal needs", reason)
+
+        signal_state.consecutive_opposite_bars = params["min_hold_bars"]
+        allowed, reason = signal_state.can_change_signal("SHORT_ACTIVE", "bearish", params)
+        self.assertTrue(allowed)
+
     def test_refresh_seconds_prefers_new_setting_and_supports_legacy_alias(self):
         with mock.patch.dict(
             os.environ,
@@ -293,6 +382,27 @@ class PredictorRegressionTests(unittest.TestCase):
         response = self.client.post("/api/notifications/test", json={})
 
         self.assertEqual(response.status_code, 404)
+
+    def test_signal_notifications_dedupe_same_signal_inside_window(self):
+        def prediction(signals, score, confidence=85):
+            return {
+                "verdict": "Bullish",
+                "confidence": confidence,
+                "action": "buy",
+                "actionState": "LONG_ACTIVE",
+                "tradeabilityLabel": "High",
+                "blockers": [],
+                "signals": signals,
+                "forecast": {"score": score},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(prediction(["Bullish structure break"], 70))
+            app_module._notify_signal_change(prediction(["Bullish structure break confirmed"], 82))
+            app_module._notify_signal_change(prediction(["Bullish continuation"], 95, confidence=96))
+
+        self.assertEqual(mocked_push.call_count, 1)
 
     def test_web_push_config_derives_public_key_when_env_key_is_mismatched(self):
         private_key = app_module.ec.generate_private_key(app_module.ec.SECP256R1())

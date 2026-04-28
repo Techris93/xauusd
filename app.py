@@ -97,11 +97,13 @@ MAX_NOTIFICATION_PAYLOAD_BYTES = 64 * 1024
 MAX_PUSH_ENDPOINT_BYTES = 2048
 MAX_PUSH_KEY_BYTES = 512
 MAX_PUSH_SUBSCRIPTIONS = 200
+NOTIFICATION_DEDUPE_SECONDS = 300
 
 latest_prediction = None
 last_update = None
 error_state = None
 last_push_snapshot = None
+last_notification = {"key": None, "time": None}
 prediction_refresh_lock = threading.RLock()
 push_lock = threading.Lock()
 
@@ -422,6 +424,35 @@ def _describe_server_signal_change(previous_snapshot, current_snapshot):
     }
 
 
+def _notification_dedupe_key(snapshot):
+    return "|".join(
+        [
+            str(snapshot.get("actionState") or "WAIT"),
+            str(snapshot.get("verdict") or "Neutral"),
+        ]
+    )
+
+
+def _should_send_signal_notification(current_snapshot, now=None):
+    global last_notification
+
+    now = now or datetime.now(timezone.utc)
+    key = _notification_dedupe_key(current_snapshot)
+    last_key = last_notification.get("key")
+    last_time = last_notification.get("time")
+
+    if (
+        key == last_key
+        and last_time is not None
+        and (now - last_time).total_seconds() < NOTIFICATION_DEDUPE_SECONDS
+    ):
+        logger.info("Skipping duplicate push alert for %s inside dedupe window.", key)
+        return False
+
+    last_notification = {"key": key, "time": now}
+    return True
+
+
 def _web_push_error_text(exc):
     response = getattr(exc, "response", None)
     if response is None:
@@ -507,6 +538,8 @@ def _notify_signal_change(prediction):
 
     change = _describe_server_signal_change(previous_snapshot, current_snapshot)
     if change is None:
+        return
+    if not _should_send_signal_notification(current_snapshot):
         return
 
     _send_web_push_notification(change["title"], change["body"], change["severity"])
