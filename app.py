@@ -524,6 +524,16 @@ def _send_web_push_notification(title, body, severity):
         _remove_push_subscription(endpoint)
 
 
+def _remember_signal_snapshot(prediction):
+    global last_push_snapshot
+
+    current_snapshot = _build_server_signal_snapshot(prediction)
+    if current_snapshot is None:
+        return None
+    last_push_snapshot = current_snapshot
+    return current_snapshot
+
+
 def _notify_signal_change(prediction):
     global last_push_snapshot
 
@@ -563,7 +573,7 @@ def _ensure_prediction_fresh():
             "Cached prediction is stale by more than %s; refreshing on demand.",
             MAX_PREDICTION_STALENESS,
         )
-        generate_prediction()
+        generate_prediction(notify=False)
         return True
 
 
@@ -716,7 +726,11 @@ def fetch_live_price():
 # PREDICTION PIPELINE
 # ============================================
 
-def generate_prediction():
+def _has_usable_prediction():
+    return isinstance(latest_prediction, dict) and not latest_prediction.get("error")
+
+
+def generate_prediction(notify=True):
     """Generate a prediction using the fixed signal engine and Twelve Data."""
     global latest_prediction, last_update, error_state
 
@@ -752,7 +766,10 @@ def generate_prediction():
             latest_prediction = _json_safe(prediction)
             last_update = datetime.now(timezone.utc)
             error_state = None
-            _notify_signal_change(latest_prediction)
+            if notify:
+                _notify_signal_change(latest_prediction)
+            else:
+                _remember_signal_snapshot(latest_prediction)
 
             logger.info(
                 "Prediction generated from Twelve Data: %s @ %s%%",
@@ -762,8 +779,11 @@ def generate_prediction():
 
         except Exception as exc:
             logger.error("Prediction error: %s", exc)
-            last_update = datetime.now(timezone.utc)
             error_state = str(exc)
+            last_update = datetime.now(timezone.utc)
+            if _has_usable_prediction():
+                logger.warning("Keeping last successful prediction after refresh failure.")
+                return
             latest_prediction = {
                 "verdict": "Neutral",
                 "confidence": 50,
@@ -854,10 +874,19 @@ def api_prediction():
             "symbol": DEFAULT_SYMBOL,
         })
 
+    has_usable_prediction = _has_usable_prediction()
+    status = (
+        "error"
+        if error_state and not has_usable_prediction
+        else "stale"
+        if error_state or _prediction_is_stale()
+        else "active"
+    )
     response = {
         **latest_prediction,
-        "status": "stale" if _prediction_is_stale() and not error_state else "active" if not error_state else "error",
-        "error": error_state
+        "status": status,
+        "error": error_state if not has_usable_prediction else None,
+        "warning": error_state if has_usable_prediction and error_state else None,
     }
 
     return jsonify(_json_safe(response))
@@ -866,8 +895,16 @@ def api_prediction():
 @app.route("/api/health")
 def health_check():
     """Health check endpoint."""
+    has_usable_prediction = _has_usable_prediction()
+    status = (
+        "error"
+        if error_state and not has_usable_prediction
+        else "stale"
+        if error_state or _prediction_is_stale()
+        else "healthy"
+    )
     return jsonify(_json_safe({
-        "status": "stale" if _prediction_is_stale() and not error_state else "healthy" if not error_state else "error",
+        "status": status,
         "lastUpdate": last_update.isoformat() if last_update else None,
         "error": error_state,
         "dataSource": "Twelve Data",

@@ -1244,6 +1244,9 @@
         } else if (data.status === "initializing") {
           statusBadge.className = "status-badge status-loading";
           statusBadge.textContent = "Initializing...";
+        } else if (data.status === "stale") {
+          statusBadge.className = "status-badge status-loading";
+          statusBadge.textContent = "Stale";
         } else {
           statusBadge.className = "status-badge status-active";
           statusBadge.textContent = "Live";

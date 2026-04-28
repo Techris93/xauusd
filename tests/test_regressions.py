@@ -333,7 +333,8 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.last_update = stale_time
         app_module.error_state = None
 
-        def fake_generate_prediction():
+        def fake_generate_prediction(notify=True):
+            self.assertFalse(notify)
             app_module.latest_prediction = {
                 "verdict": "Bullish",
                 "confidence": 91,
@@ -353,7 +354,46 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(payload.get("status"), "active")
         self.assertEqual(payload.get("timestamp"), fresh_iso)
         self.assertEqual(payload.get("verdict"), "Bullish")
-        mocked_generate.assert_called_once()
+        mocked_generate.assert_called_once_with(notify=False)
+
+    def test_refresh_failure_keeps_last_good_prediction_visible(self):
+        fresh_time = datetime.now(timezone.utc)
+        fresh_iso = fresh_time.isoformat()
+        app_module.latest_prediction = {
+            "verdict": "Bullish",
+            "confidence": 88,
+            "currentPrice": 2500.12,
+            "timestamp": fresh_iso,
+            "lastUpdate": fresh_iso,
+            "dataSource": "Twelve Data",
+            "symbol": app_module.DEFAULT_SYMBOL,
+            "forecast": {"score": 72},
+        }
+        app_module.last_update = fresh_time
+        app_module.error_state = None
+
+        with mock.patch.object(app_module, "fetch_xauusd_data", side_effect=RuntimeError("rate limited")):
+            app_module.generate_prediction()
+
+        response = self.client.get("/api/prediction")
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload.get("status"), "stale")
+        self.assertIsNone(payload.get("error"))
+        self.assertIn("rate limited", payload.get("warning"))
+        self.assertEqual(payload.get("currentPrice"), 2500.12)
+
+    def test_request_driven_prediction_refresh_updates_snapshot_without_push(self):
+        frame = self.build_frame(volume=0.0)
+
+        with mock.patch.object(app_module, "fetch_xauusd_data", return_value=frame.copy()):
+            with mock.patch.object(app_module, "fetch_live_price", return_value=2500.12):
+                with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+                    app_module.generate_prediction(notify=False)
+
+        self.assertIsNotNone(app_module.last_push_snapshot)
+        mocked_push.assert_not_called()
 
     def test_notification_service_worker_route_is_available(self):
         response = self.client.get("/notification-sw.js")
