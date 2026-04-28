@@ -36,6 +36,20 @@ last_update = None
 error_state = None
 
 
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "item") and callable(value.item):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def _twelve_data_api_key():
     return (
         os.getenv("TWELVE_DATA_API_KEY", "").strip()
@@ -206,7 +220,7 @@ def generate_prediction():
             "timestamps": [timestamp.isoformat() for timestamp in recent_frame.index],
         }
 
-        latest_prediction = prediction
+        latest_prediction = _json_safe(prediction)
         last_update = datetime.now(timezone.utc)
         error_state = None
 
@@ -258,20 +272,20 @@ def api_prediction():
         "error": error_state
     }
 
-    return jsonify(response)
+    return jsonify(_json_safe(response))
 
 
 @app.route("/api/health")
 def health_check():
     """Health check endpoint."""
-    return jsonify({
+    return jsonify(_json_safe({
         "status": "healthy" if not error_state else "error",
         "lastUpdate": last_update.isoformat() if last_update else None,
         "error": error_state,
         "dataSource": "Twelve Data",
         "symbol": DEFAULT_SYMBOL,
         "timeframe": DEFAULT_INTERVAL,
-    })
+    }))
 
 
 # ============================================
