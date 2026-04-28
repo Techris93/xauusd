@@ -478,13 +478,21 @@ def prepare_data(df, params=None):
     supports.append({'label': 'Round Number', 'price': round_support})
     resistances.append({'label': 'Round Number', 'price': round_resistance})
 
-    frame.at[frame.index[-1], 'nearest_support'] = max(
-        [s for s in supports if s['price'] <= current_price], 
+    if 'nearest_support' not in frame.columns:
+        frame['nearest_support'] = None
+    if 'nearest_resistance' not in frame.columns:
+        frame['nearest_resistance'] = None
+
+    nearest_support = max(
+        [s for s in supports if s['price'] <= current_price],
         key=lambda x: x['price'], default=None
     )
-    frame.at[frame.index[-1], 'nearest_resistance'] = min(
+    nearest_resistance = min(
         [r for r in resistances if r['price'] >= current_price],
         key=lambda x: x['price'], default=None
     )
+
+    frame.iat[-1, frame.columns.get_loc('nearest_support')] = nearest_support
+    frame.iat[-1, frame.columns.get_loc('nearest_resistance')] = nearest_resistance
 
     return frame
