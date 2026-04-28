@@ -11,6 +11,7 @@ import re
 import threading
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from urllib.parse import urlparse
 
 import pandas as pd
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -65,6 +66,10 @@ WEB_PUSH_SUBJECT = (
 WEB_PUSH_SUBSCRIPTIONS_PATH = os.path.join(BASE_DIR, "runtime_webpush_subscriptions.json")
 WEB_PUSH_VAPID_PATH = os.path.join(BASE_DIR, "runtime_webpush_vapid.json")
 WEB_PUSH_VAPID_PEM_PATH = os.path.join(BASE_DIR, "runtime_webpush_vapid_private.pem")
+MAX_NOTIFICATION_PAYLOAD_BYTES = 64 * 1024
+MAX_PUSH_ENDPOINT_BYTES = 2048
+MAX_PUSH_KEY_BYTES = 512
+MAX_PUSH_SUBSCRIPTIONS = 200
 
 latest_prediction = None
 last_update = None
@@ -111,9 +116,11 @@ def _read_json_file(path, default):
         return default
 
 
-def _write_json_file(path, payload):
+def _write_json_file(path, payload, mode=None):
     with open(path, "w", encoding="utf-8") as file_handle:
         json.dump(payload, file_handle, indent=2)
+    if mode is not None:
+        os.chmod(path, mode)
 
 
 def _build_vapid_private_key(private_key_b64):
@@ -142,6 +149,7 @@ def _write_vapid_pem(private_key_b64):
     )
     with open(WEB_PUSH_VAPID_PEM_PATH, "wb") as file_handle:
         file_handle.write(pem_bytes)
+    os.chmod(WEB_PUSH_VAPID_PEM_PATH, 0o600)
     return WEB_PUSH_VAPID_PEM_PATH
 
 
@@ -154,7 +162,7 @@ def _generate_runtime_vapid_keys():
         "subject": WEB_PUSH_SUBJECT,
         "source": "runtime",
     }
-    _write_json_file(WEB_PUSH_VAPID_PATH, payload)
+    _write_json_file(WEB_PUSH_VAPID_PATH, payload, mode=0o600)
     return payload
 
 
@@ -163,9 +171,15 @@ def _ensure_web_push_keys():
     env_public_key = os.getenv("WEB_PUSH_VAPID_PUBLIC_KEY", "").strip()
     if env_private_key:
         private_key = _build_vapid_private_key(env_private_key)
+        derived_public_key = _public_key_from_private_key(private_key)
+        if env_public_key and env_public_key != derived_public_key:
+            logger.warning(
+                "WEB_PUSH_VAPID_PUBLIC_KEY does not match WEB_PUSH_VAPID_PRIVATE_KEY; "
+                "using the derived public key."
+            )
         payload = {
             "privateKey": env_private_key,
-            "publicKey": env_public_key or _public_key_from_private_key(private_key),
+            "publicKey": derived_public_key,
             "subject": WEB_PUSH_SUBJECT,
             "source": "env",
         }
@@ -175,6 +189,8 @@ def _ensure_web_push_keys():
     payload = _read_json_file(WEB_PUSH_VAPID_PATH, default={})
     if not isinstance(payload, dict) or not payload.get("privateKey") or not payload.get("publicKey"):
         payload = _generate_runtime_vapid_keys()
+    else:
+        payload["subject"] = WEB_PUSH_SUBJECT
 
     _write_vapid_pem(payload["privateKey"])
     return payload
@@ -224,7 +240,7 @@ def _load_push_subscriptions():
 
 
 def _save_push_subscriptions(subscriptions):
-    _write_json_file(WEB_PUSH_SUBSCRIPTIONS_PATH, subscriptions)
+    _write_json_file(WEB_PUSH_SUBSCRIPTIONS_PATH, subscriptions, mode=0o600)
 
 
 def _normalize_push_subscription(subscription):
@@ -237,10 +253,25 @@ def _normalize_push_subscription(subscription):
     auth = str(keys.get("auth", "")).strip()
     if not endpoint or not p256dh or not auth:
         return None
+    if len(endpoint.encode("utf-8")) > MAX_PUSH_ENDPOINT_BYTES:
+        return None
+    if (
+        len(p256dh.encode("utf-8")) > MAX_PUSH_KEY_BYTES
+        or len(auth.encode("utf-8")) > MAX_PUSH_KEY_BYTES
+    ):
+        return None
+
+    parsed_endpoint = urlparse(endpoint)
+    if parsed_endpoint.scheme != "https" or not parsed_endpoint.netloc:
+        return None
+
+    expiration_time = subscription.get("expirationTime")
+    if expiration_time is not None and not isinstance(expiration_time, (int, float)):
+        expiration_time = None
 
     return {
         "endpoint": endpoint,
-        "expirationTime": subscription.get("expirationTime"),
+        "expirationTime": expiration_time,
         "keys": {
             "p256dh": p256dh,
             "auth": auth,
@@ -259,6 +290,8 @@ def _upsert_push_subscription(subscription):
             for item in _load_push_subscriptions()
             if item.get("endpoint") != normalized["endpoint"]
         ]
+        if len(subscriptions) >= MAX_PUSH_SUBSCRIPTIONS:
+            raise ValueError("Push subscription limit reached")
         subscriptions.append(normalized)
         _save_push_subscriptions(subscriptions)
         return len(subscriptions)
@@ -445,6 +478,15 @@ def _twelve_data_api_key():
     )
 
 
+def _parse_positive_int(value, default, label):
+    try:
+        parsed = int(str(value or "").strip())
+    except ValueError:
+        logger.warning("Invalid %s %r; defaulting to %s.", label, value, default)
+        return default
+    return parsed if parsed > 0 else default
+
+
 @lru_cache(maxsize=1)
 def get_td_client():
     api_key = _twelve_data_api_key()
@@ -477,11 +519,11 @@ def bars_for_period(period, interval):
     td_interval = interval_to_twelvedata(interval)
 
     if raw_period.endswith("d"):
-        days = int(raw_period[:-1] or "0")
+        days = _parse_positive_int(raw_period[:-1], 5, "PREDICTOR_PERIOD")
     elif raw_period.endswith("mo"):
-        days = int(raw_period[:-2] or "0") * 30
+        days = _parse_positive_int(raw_period[:-2], 1, "PREDICTOR_PERIOD") * 30
     elif raw_period.endswith("y"):
-        days = int(raw_period[:-1] or "0") * 365
+        days = _parse_positive_int(raw_period[:-1], 1, "PREDICTOR_PERIOD") * 365
     else:
         days = 5
 
@@ -526,6 +568,8 @@ def normalize_ohlcv_frame(frame):
         df.index = df.index.tz_localize(TD_OUTPUT_TIMEZONE)
     else:
         df.index = df.index.tz_convert(TD_OUTPUT_TIMEZONE)
+
+    df = df[~df.index.isna()]
 
     if "Volume" not in df.columns:
         df["Volume"] = 0.0
@@ -622,6 +666,7 @@ def generate_prediction():
 
         except Exception as exc:
             logger.error("Prediction error: %s", exc)
+            last_update = datetime.now(timezone.utc)
             error_state = str(exc)
             latest_prediction = {
                 "verdict": "Neutral",
@@ -669,6 +714,8 @@ def notification_subscribe():
     config = get_web_push_config()
     if not config.get("available"):
         return jsonify({"ok": False, "error": config.get("warning") or "Web push is unavailable."}), 503
+    if request.content_length and request.content_length > MAX_NOTIFICATION_PAYLOAD_BYTES:
+        return jsonify({"ok": False, "error": "Notification payload is too large."}), 413
 
     payload = request.get_json(silent=True) or {}
     subscription = payload.get("subscription") or payload
@@ -682,6 +729,9 @@ def notification_subscribe():
 
 @app.route("/api/notifications/unsubscribe", methods=["POST"])
 def notification_unsubscribe():
+    if request.content_length and request.content_length > MAX_NOTIFICATION_PAYLOAD_BYTES:
+        return jsonify({"ok": False, "error": "Notification payload is too large."}), 413
+
     payload = request.get_json(silent=True) or {}
     endpoint = payload.get("endpoint") or (payload.get("subscription") or {}).get("endpoint")
     subscriber_count = _remove_push_subscription(endpoint)
@@ -720,8 +770,6 @@ def api_prediction():
 @app.route("/api/health")
 def health_check():
     """Health check endpoint."""
-    _ensure_prediction_fresh()
-
     return jsonify(_json_safe({
         "status": "stale" if _prediction_is_stale() and not error_state else "healthy" if not error_state else "error",
         "lastUpdate": last_update.isoformat() if last_update else None,

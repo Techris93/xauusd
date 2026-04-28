@@ -1246,22 +1246,24 @@
 
         const signalList = document.getElementById("signalList");
         if (data.signals && data.signals.length > 0) {
-          signalList.innerHTML = data.signals
-            .map((signal) => {
-              const lowerSignal = signal.toLowerCase();
+          signalList.replaceChildren(
+            ...data.signals.map((signal) => {
+              const item = document.createElement("li");
+              const lowerSignal = String(signal || "").toLowerCase();
               const isBullish = lowerSignal.includes("bullish");
               const isBearish = lowerSignal.includes("bearish");
-              const signalClass = isBullish
-                ? "bullish"
-                : isBearish
-                  ? "bearish"
-                  : "";
-              return `<li class="signal-item ${signalClass}">${signal}</li>`;
-            })
-            .join("");
+              item.className =
+                "signal-item" +
+                (isBullish ? " bullish" : isBearish ? " bearish" : "");
+              item.textContent = String(signal || "");
+              return item;
+            }),
+          );
         } else {
-          signalList.innerHTML =
-            '<li class="signal-item">No active signals</li>';
+          const item = document.createElement("li");
+          item.className = "signal-item";
+          item.textContent = "No active signals";
+          signalList.replaceChildren(item);
         }
 
         document.getElementById("slValue").textContent = data.stopLoss || "--";
@@ -1272,9 +1274,14 @@
         const blockersSection = document.getElementById("blockersSection");
         if (data.blockers && data.blockers.length > 0) {
           blockersSection.style.display = "block";
-          document.getElementById("blockerList").innerHTML = data.blockers
-            .map((blocker) => `<li class="blocker-item">⚠️ ${blocker}</li>`)
-            .join("");
+          document.getElementById("blockerList").replaceChildren(
+            ...data.blockers.map((blocker) => {
+              const item = document.createElement("li");
+              item.className = "blocker-item";
+              item.textContent = `Warning: ${String(blocker || "")}`;
+              return item;
+            }),
+          );
         } else {
           blockersSection.style.display = "none";
         }
@@ -1385,8 +1392,11 @@
       }
 
       function showError(message) {
-        document.getElementById("loadingState").innerHTML =
-          `<div style="color: #ff4444;">❌ ${message}</div>`;
+        const loadingState = document.getElementById("loadingState");
+        const errorMessage = document.createElement("div");
+        errorMessage.style.color = "#ff4444";
+        errorMessage.textContent = `Error: ${message}`;
+        loadingState.replaceChildren(errorMessage);
       }
 
       async function bootstrapNotifications() {

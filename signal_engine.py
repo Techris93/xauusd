@@ -4,7 +4,6 @@ Fixed Signal Engine for Gold Predictor
 Addresses: Over-filtering, lagging confirmation, session blocking, 
 structure break anticipation, and deadlock issues.
 """
-import json
 import math
 import numpy as np
 import pandas as pd
@@ -52,33 +51,30 @@ def detect_structure_break(df, lookback=5):
     if len(df) < lookback + 2:
         return "none", 0.0
 
-    recent = df.tail(lookback)
+    recent = df.iloc[-(lookback + 1):-1]
     current_close = df['Close'].iloc[-1]
     prev_close = df['Close'].iloc[-2]
 
     # Find recent swing high/low
     recent_high = recent['High'].max()
     recent_low = recent['Low'].min()
-    high_idx = recent['High'].idxmax()
-    low_idx = recent['Low'].idxmin()
 
-    # Check for lower highs (bearish structure)
-    highs = df['High'].tail(lookback * 2).tolist()
-    lows = df['Low'].tail(lookback * 2).tolist()
+    # Check lower-high / higher-low structure on completed candles only.
+    highs = df['High'].iloc[-((lookback * 2) + 1):-1].tolist()
+    lows = df['Low'].iloc[-((lookback * 2) + 1):-1].tolist()
 
     bearish_structure = False
     bullish_structure = False
 
     # Bearish: lower high + break below recent low
     if len(highs) >= 3:
-        # Check for lower highs pattern
-        lower_highs = all(highs[i] >= highs[i+1] for i in range(len(highs)-2, len(highs)-1))
+        lower_highs = all(highs[i] >= highs[i + 1] for i in range(len(highs) - 2, len(highs) - 1))
         if lower_highs and current_close < recent_low:
             bearish_structure = True
 
     # Bullish: higher low + break above recent high  
     if len(lows) >= 3:
-        higher_lows = all(lows[i] <= lows[i+1] for i in range(len(lows)-2, len(lows)-1))
+        higher_lows = all(lows[i] <= lows[i + 1] for i in range(len(lows) - 2, len(lows) - 1))
         if higher_lows and current_close > recent_high:
             bullish_structure = True
 
@@ -89,7 +85,7 @@ def detect_structure_break(df, lookback=5):
     ma_break_bearish = False
     ma_break_bullish = False
 
-    if ema20 and ema50:
+    if pd.notna(ema20) and pd.notna(ema50):
         # Price below both MAs = bearish alignment
         if current_close < ema20 and current_close < ema50 and prev_close >= ema20:
             ma_break_bearish = True
@@ -122,25 +118,28 @@ def detect_vwap_rejection(df):
 
     current = df.iloc[-1]
     prev = df.iloc[-2]
-    prev2 = df.iloc[-3]
 
     vwap = current['VWAP']
     close = current['Close']
 
     # Bearish rejection: price below VWAP and falling
-    if close < vwap and prev['Close'] < prev['VWAP']:
+    prev_vwap = prev['VWAP']
+    if pd.isna(vwap) or pd.isna(prev_vwap) or vwap == 0 or prev_vwap == 0:
+        return "neutral", 0.0
+
+    if close < vwap and prev['Close'] < prev_vwap:
         # Check if price is accelerating away from VWAP
         dist_now = abs(close - vwap) / vwap * 100
-        dist_prev = abs(prev['Close'] - prev['VWAP']) / prev['VWAP'] * 100
+        dist_prev = abs(prev['Close'] - prev_vwap) / prev_vwap * 100
 
         if dist_now > dist_prev:
             strength = min(0.5 + (dist_now - dist_prev) * 10, 1.0)
             return "bearish_rejection", strength
 
     # Bullish rejection: price above VWAP and rising
-    if close > vwap and prev['Close'] > prev['VWAP']:
+    if close > vwap and prev['Close'] > prev_vwap:
         dist_now = abs(close - vwap) / vwap * 100
-        dist_prev = abs(prev['Close'] - prev['VWAP']) / prev['VWAP'] * 100
+        dist_prev = abs(prev['Close'] - prev_vwap) / prev_vwap * 100
 
         if dist_now > dist_prev:
             strength = min(0.5 + (dist_now - dist_prev) * 10, 1.0)
@@ -196,7 +195,7 @@ def calculate_anticipatory_score(df, params):
     # 3. MA alignment (trend confirmation)
     ema20 = current.get('EMA_20')
     ema50 = current.get('EMA_50')
-    if ema20 and ema50:
+    if pd.notna(ema20) and pd.notna(ema50):
         if current['Close'] < ema20 < ema50:
             score += 15
             if direction == "neutral":
@@ -222,22 +221,42 @@ def calculate_anticipatory_score(df, params):
         score += 10
         signals.append("Volume spike")
 
-    # 6. Support/Resistance proximity
-    if 'nearest_support' in current and current['nearest_support']:
-        sup_dist = abs(current['Close'] - current['nearest_support']['price']) / current['Close'] * 100
-        if sup_dist < 0.15:  # Very close to support
-            if direction == "bearish":
-                score += 10  # Breaking support = big signal
-                signals.append("Breaking key support")
-
-    if 'nearest_resistance' in current and current['nearest_resistance']:
-        res_dist = abs(current['nearest_resistance']['price'] - current['Close']) / current['Close'] * 100
-        if res_dist < 0.15:
-            if direction == "bullish":
-                score += 10
-                signals.append("Breaking key resistance")
+    # 6. Support/Resistance break
+    sr_break = detect_support_resistance_break(current, prev)
+    if direction == "bearish" and sr_break == "support":
+        score += 10
+        signals.append("Breaking key support")
+    elif direction == "bullish" and sr_break == "resistance":
+        score += 10
+        signals.append("Breaking key resistance")
 
     return min(score, 100), direction, signals
+
+
+def detect_support_resistance_break(current, prev):
+    current_close = current.get('Close')
+    prev_close = prev.get('Close')
+    if pd.isna(current_close) or pd.isna(prev_close) or current_close <= 0 or prev_close <= 0:
+        return "none"
+
+    recent_low = current.get('RECENT_SWING_LOW')
+    if pd.notna(recent_low) and current_close < recent_low:
+        return "support"
+
+    recent_high = current.get('RECENT_SWING_HIGH')
+    if pd.notna(recent_high) and current_close > recent_high:
+        return "resistance"
+
+    step = 5.0 if max(current_close, prev_close) >= 1000 else 1.0
+    broken_support = math.floor(prev_close / step) * step
+    if current_close < broken_support <= prev_close:
+        return "support"
+
+    broken_resistance = math.ceil(prev_close / step) * step
+    if prev_close <= broken_resistance < current_close:
+        return "resistance"
+
+    return "none"
 
 
 # ============================================
@@ -260,7 +279,7 @@ def calculate_confidence(score, direction, df, params):
     ema20 = current.get('EMA_20')
     ema50 = current.get('EMA_50')
 
-    if ema20 and ema50:
+    if pd.notna(ema20) and pd.notna(ema50):
         if direction == "bearish" and current['Close'] < ema20 < ema50:
             base_confidence += 10
         elif direction == "bullish" and current['Close'] > ema20 > ema50:
@@ -269,8 +288,10 @@ def calculate_confidence(score, direction, df, params):
     # Cap at 95
     confidence = min(base_confidence, 95)
 
+    min_signal_score = params.get('min_signal_score', params['min_confidence'])
+
     # Determine verdict
-    if confidence >= params['min_confidence']:
+    if score >= min_signal_score and confidence >= params['min_confidence']:
         verdict = "Bullish" if direction == "bullish" else "Bearish"
     else:
         verdict = "Neutral"
@@ -328,6 +349,8 @@ def calculate_stop_loss_take_profit(current_price, direction, df, params):
     ATR-based SL/TP with proper risk:reward.
     """
     atr = df['ATR_14'].iloc[-1] if 'ATR_14' in df else current_price * 0.002
+    if pd.isna(atr) or atr <= 0:
+        atr = current_price * 0.002
 
     sl_distance = atr * params['sl_atr_mult']
     tp_distance = atr * params['tp_atr_mult']
@@ -432,6 +455,10 @@ def prepare_data(df, params=None):
     for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
         if col in frame.columns:
             frame[col] = pd.to_numeric(frame[col], errors='coerce')
+    if 'Volume' not in frame.columns:
+        frame['Volume'] = 0.0
+    else:
+        frame['Volume'] = frame['Volume'].fillna(0.0)
 
     frame = frame.dropna(subset=['Open', 'High', 'Low', 'Close'])
 
