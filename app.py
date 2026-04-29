@@ -378,6 +378,8 @@ def _build_server_signal_snapshot(prediction):
 def _build_server_alert_title(previous_snapshot, current_snapshot):
     if previous_snapshot["actionState"] != current_snapshot["actionState"] and current_snapshot["actionState"] in {"LONG_ACTIVE", "SHORT_ACTIVE"}:
         return "XAU/USD long signal active" if current_snapshot["action"] == "buy" else "XAU/USD short signal active"
+    if previous_snapshot["actionState"] in {"LONG_ACTIVE", "SHORT_ACTIVE"} and current_snapshot["actionState"] == "WAIT":
+        return "XAU/USD signal paused"
     if previous_snapshot["verdict"] != current_snapshot["verdict"]:
         return f"XAU/USD bias changed to {current_snapshot['verdict']}"
     if previous_snapshot["hasBlockers"] and not current_snapshot["hasBlockers"]:
@@ -385,8 +387,30 @@ def _build_server_alert_title(previous_snapshot, current_snapshot):
     return "XAU/USD signal update"
 
 
+def _is_actionable_signal_snapshot(snapshot):
+    if snapshot["hasBlockers"]:
+        return False
+    if snapshot["actionState"] == "LONG_ACTIVE":
+        return snapshot["action"] == "buy" and snapshot["verdict"] == "Bullish"
+    if snapshot["actionState"] == "SHORT_ACTIVE":
+        return snapshot["action"] == "sell" and snapshot["verdict"] == "Bearish"
+    return False
+
+
+def _is_pushworthy_signal_change(previous_snapshot, current_snapshot):
+    previous_actionable = _is_actionable_signal_snapshot(previous_snapshot)
+    current_actionable = _is_actionable_signal_snapshot(current_snapshot)
+
+    if current_actionable:
+        return True
+
+    return previous_actionable and current_snapshot["actionState"] == "WAIT"
+
+
 def _describe_server_signal_change(previous_snapshot, current_snapshot):
     if previous_snapshot is None or current_snapshot is None:
+        return None
+    if not _is_pushworthy_signal_change(previous_snapshot, current_snapshot):
         return None
 
     changes = []

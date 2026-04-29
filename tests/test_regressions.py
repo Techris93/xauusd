@@ -454,6 +454,73 @@ class PredictorRegressionTests(unittest.TestCase):
 
         self.assertEqual(mocked_push.call_count, 1)
 
+    def test_cooldown_blocked_wait_prediction_does_not_send_active_push(self):
+        app_module.last_push_snapshot = {
+            "verdict": "Neutral",
+            "action": "hold",
+            "actionState": "WAIT",
+            "tradeabilityLabel": "Low",
+            "confidence": 50.0,
+            "score": 80.0,
+            "signals": [],
+            "signalsKey": "",
+            "hasBlockers": False,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        blocked_prediction = {
+            "verdict": "Neutral",
+            "confidence": 95,
+            "action": "hold",
+            "actionState": "WAIT",
+            "tradeabilityLabel": "High",
+            "blockers": ["Warning: Cooldown active: 4.7min remaining"],
+            "signals": [
+                "Bearish structure break (strength: 1.00)",
+                "VWAP bearish rejection (strength: 1.00)",
+                "Bearish MA alignment",
+            ],
+            "forecast": {"score": 90},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(blocked_prediction)
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertTrue(app_module.last_push_snapshot["hasBlockers"])
+
+    def test_active_push_requires_unblocked_actionable_prediction(self):
+        app_module.last_push_snapshot = {
+            "verdict": "Neutral",
+            "action": "hold",
+            "actionState": "WAIT",
+            "tradeabilityLabel": "Low",
+            "confidence": 50.0,
+            "score": 80.0,
+            "signals": [],
+            "signalsKey": "",
+            "hasBlockers": True,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        active_prediction = {
+            "verdict": "Bearish",
+            "confidence": 95,
+            "action": "sell",
+            "actionState": "SHORT_ACTIVE",
+            "tradeabilityLabel": "High",
+            "blockers": [],
+            "signals": ["Bearish structure break (strength: 1.00)"],
+            "forecast": {"score": 90},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(active_prediction)
+
+        mocked_push.assert_called_once()
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD short signal active")
+
     def test_web_push_config_derives_public_key_when_env_key_is_mismatched(self):
         private_key = app_module.ec.generate_private_key(app_module.ec.SECP256R1())
         private_key_b64 = app_module._urlsafe_b64encode(
