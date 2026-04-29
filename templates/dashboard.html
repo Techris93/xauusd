@@ -1205,21 +1205,7 @@
           return;
         }
 
-        const change = describeImportantChange(
-          previousSignalSnapshot,
-          currentSnapshot,
-        );
         previousSignalSnapshot = currentSnapshot;
-
-        if (
-          !change ||
-          !alertsEnabled ||
-          document.visibilityState !== "visible"
-        ) {
-          return;
-        }
-
-        showToast(`${change.title}: ${change.body}`, change.severity);
       }
 
       async function fetchPrediction() {

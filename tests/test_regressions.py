@@ -407,6 +407,16 @@ class PredictorRegressionTests(unittest.TestCase):
             'self.addEventListener("notificationclick"',
             response_body,
         )
+        self.assertIn("showNotification", response_body)
+        self.assertNotIn("hasVisibleClient", response_body)
+
+    def test_dashboard_does_not_show_duplicate_in_app_signal_toasts(self):
+        response = self.client.get("/")
+        response_body = response.get_data(as_text=True)
+        response.close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("showToast(`${change.title}", response_body)
 
     def test_notification_config_route_returns_metadata(self):
         response = self.client.get("/api/notifications/config")

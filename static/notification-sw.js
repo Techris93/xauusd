@@ -32,18 +32,6 @@ self.addEventListener("push", (event) => {
 
   event.waitUntil(
     (async () => {
-      const clients = await self.clients.matchAll({
-        type: "window",
-        includeUncontrolled: true,
-      });
-      const hasVisibleClient = clients.some(
-        (client) => client.visibilityState === "visible" || client.focused,
-      );
-
-      if (hasVisibleClient) {
-        return;
-      }
-
       await self.registration.showNotification(title, options);
     })(),
   );
