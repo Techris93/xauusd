@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -105,6 +106,45 @@ class PredictorRegressionTests(unittest.TestCase):
         frame["nearest_support"] = [{"label": "Round Number", "price": 99.0}] * len(frame)
         frame["nearest_resistance"] = [{"label": "Round Number", "price": 105.0}] * len(frame)
         return frame
+
+    @staticmethod
+    def wait_snapshot(score=22.5, has_blockers=True):
+        return {
+            "verdict": "Neutral",
+            "action": "hold",
+            "actionState": "WAIT",
+            "tradeabilityLabel": "Low",
+            "confidence": 50.0,
+            "score": score,
+            "threshold": 45.0,
+            "signals": [],
+            "signalsKey": "",
+            "hasBlockers": has_blockers,
+            "blockers": ["Tradeability 22.5 below threshold 45"] if has_blockers else [],
+            "isActionable": False,
+            "suppressionReasons": [],
+            "displayStatus": "Waiting for Signal",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @staticmethod
+    def active_prediction(action_state="SHORT_ACTIVE", score=60, blockers=None):
+        is_long = action_state == "LONG_ACTIVE"
+        entry_price = 2400.0
+        return {
+            "verdict": "Bullish" if is_long else "Bearish",
+            "confidence": 82,
+            "action": "buy" if is_long else "sell",
+            "actionState": action_state,
+            "tradeabilityLabel": "High",
+            "blockers": list(blockers or []),
+            "signals": ["Bullish structure break" if is_long else "Bearish structure break"],
+            "forecast": {"score": score},
+            "entryPrice": entry_price,
+            "stopLoss": entry_price - 3.0 if is_long else entry_price + 3.0,
+            "takeProfit": entry_price + 6.0 if is_long else entry_price - 6.0,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
     def test_prepare_data_assigns_nearest_levels_without_existing_columns(self):
         prepared = prepare_data(self.build_frame())
@@ -409,6 +449,8 @@ class PredictorRegressionTests(unittest.TestCase):
         )
         self.assertIn("showNotification", response_body)
         self.assertNotIn("hasVisibleClient", response_body)
+        self.assertIn("SIGNAL_PUSH_PAYLOAD_VERSION", response_body)
+        self.assertIn("Ignoring stale signal push payload", response_body)
 
     def test_dashboard_does_not_show_duplicate_in_app_signal_toasts(self):
         response = self.client.get("/")
@@ -417,6 +459,30 @@ class PredictorRegressionTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("showToast(`${change.title}", response_body)
+
+    def test_dashboard_declares_favicon_and_manifest(self):
+        response = self.client.get("/")
+        response_body = response.get_data(as_text=True)
+        response.close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('rel="icon"', response_body)
+        self.assertIn('href="/static/favicon.svg"', response_body)
+        self.assertIn('rel="manifest"', response_body)
+        self.assertIn('href="/static/site.webmanifest"', response_body)
+
+    def test_favicon_and_manifest_assets_are_available(self):
+        favicon_response = self.client.get("/static/favicon.svg")
+        manifest_response = self.client.get("/static/site.webmanifest")
+        manifest_payload = json.loads(manifest_response.get_data(as_text=True))
+        favicon_response.close()
+        manifest_response.close()
+
+        self.assertEqual(favicon_response.status_code, 200)
+        self.assertIn("image/svg+xml", favicon_response.content_type)
+        self.assertEqual(manifest_response.status_code, 200)
+        self.assertEqual(manifest_payload.get("name"), "XAUUSD Predictor")
+        self.assertEqual(manifest_payload["icons"][0]["src"], "/static/favicon.svg")
 
     def test_notification_config_route_returns_metadata(self):
         response = self.client.get("/api/notifications/config")
@@ -444,6 +510,9 @@ class PredictorRegressionTests(unittest.TestCase):
                 "blockers": [],
                 "signals": signals,
                 "forecast": {"score": score},
+                "entryPrice": 2400.0,
+                "stopLoss": 2397.0,
+                "takeProfit": 2406.0,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -455,18 +524,7 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(mocked_push.call_count, 1)
 
     def test_cooldown_blocked_wait_prediction_does_not_send_active_push(self):
-        app_module.last_push_snapshot = {
-            "verdict": "Neutral",
-            "action": "hold",
-            "actionState": "WAIT",
-            "tradeabilityLabel": "Low",
-            "confidence": 50.0,
-            "score": 80.0,
-            "signals": [],
-            "signalsKey": "",
-            "hasBlockers": False,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        app_module.last_push_snapshot = self.wait_snapshot(score=80.0, has_blockers=False)
         blocked_prediction = {
             "verdict": "Neutral",
             "confidence": 95,
@@ -491,35 +549,100 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertTrue(app_module.last_push_snapshot["hasBlockers"])
 
     def test_active_push_requires_unblocked_actionable_prediction(self):
-        app_module.last_push_snapshot = {
-            "verdict": "Neutral",
-            "action": "hold",
-            "actionState": "WAIT",
-            "tradeabilityLabel": "Low",
-            "confidence": 50.0,
-            "score": 80.0,
-            "signals": [],
-            "signalsKey": "",
-            "hasBlockers": True,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        active_prediction = {
-            "verdict": "Bearish",
-            "confidence": 95,
-            "action": "sell",
-            "actionState": "SHORT_ACTIVE",
-            "tradeabilityLabel": "High",
-            "blockers": [],
-            "signals": ["Bearish structure break (strength: 1.00)"],
-            "forecast": {"score": 90},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        app_module.last_push_snapshot = self.wait_snapshot(score=80.0)
+        active_prediction = self.active_prediction("SHORT_ACTIVE", score=90)
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
             app_module._notify_signal_change(active_prediction)
 
         mocked_push.assert_called_once()
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD short signal active")
+
+    def test_neutral_blocked_low_score_cannot_send_short_active_push(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+        bad_prediction = self.active_prediction(
+            "SHORT_ACTIVE",
+            score=25,
+            blockers=["Tradeability 22.5 below threshold 45"],
+        )
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(bad_prediction)
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertEqual(app_module.last_push_snapshot["verdict"], "Neutral")
+        self.assertTrue(app_module.last_push_snapshot["hasBlockers"])
+
+    def test_bearish_ma_alignment_alone_cannot_send_short_active_below_threshold(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+        bad_prediction = self.active_prediction("SHORT_ACTIVE", score=25)
+        bad_prediction["tradeabilityLabel"] = "Medium"
+        bad_prediction["signals"] = ["Bearish MA alignment"]
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(bad_prediction)
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertIn(
+            "signal score 25 below threshold 45",
+            app_module.last_push_snapshot["blockers"],
+        )
+
+    def test_blockers_cleared_requires_empty_validated_blockers(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+        bad_prediction = self.active_prediction("SHORT_ACTIVE", score=25)
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(bad_prediction)
+
+        mocked_push.assert_not_called()
+        self.assertTrue(app_module.last_push_snapshot["blockers"])
+        self.assertNotIn("Blockers cleared", " | ".join(app_module.last_push_snapshot["blockers"]))
+
+    def test_dashboard_and_notification_use_same_authoritative_signal_state(self):
+        raw_prediction = self.active_prediction("SHORT_ACTIVE", score=25)
+        dashboard_prediction = app_module._apply_authoritative_signal_state(raw_prediction)
+        notification_snapshot = app_module._build_server_signal_snapshot(raw_prediction)
+
+        self.assertEqual(dashboard_prediction["actionState"], notification_snapshot["actionState"])
+        self.assertEqual(dashboard_prediction["verdict"], notification_snapshot["verdict"])
+        self.assertEqual(dashboard_prediction["blockers"], notification_snapshot["blockers"])
+        self.assertEqual(dashboard_prediction["actionState"], "WAIT")
+        self.assertEqual(dashboard_prediction["verdict"], "Neutral")
+
+    def test_valid_short_active_push_requires_score_blockers_signal_price_and_risk(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+        active_prediction = self.active_prediction("SHORT_ACTIVE", score=60)
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(active_prediction)
+
+        mocked_push.assert_called_once()
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD short signal active")
+
+    def test_valid_long_active_push_requires_score_blockers_signal_price_and_risk(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+        active_prediction = self.active_prediction("LONG_ACTIVE", score=60)
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(active_prediction)
+
+        mocked_push.assert_called_once()
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD long signal active")
+
+    def test_active_trade_push_is_suppressed_without_valid_risk_values(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+        active_prediction = self.active_prediction("SHORT_ACTIVE", score=60)
+        active_prediction["takeProfit"] = None
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(active_prediction)
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertIn("risk management is incomplete", app_module.last_push_snapshot["blockers"])
 
     def test_web_push_config_derives_public_key_when_env_key_is_mismatched(self):
         private_key = app_module.ec.generate_private_key(app_module.ec.SECP256R1())
@@ -581,6 +704,34 @@ class PredictorRegressionTests(unittest.TestCase):
         exc.response = Response()
 
         self.assertTrue(app_module._is_stale_push_failure(exc))
+
+    def test_web_push_payload_includes_authoritative_signal_version(self):
+        sample_subscription = {
+            "endpoint": "https://example.com/subscriptions/device-1",
+            "expirationTime": None,
+            "keys": {
+                "p256dh": "sample-p256dh-key",
+                "auth": "sample-auth-key",
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            subscriptions_path = str(Path(temp_dir) / "push_subscriptions.json")
+            push_config = {
+                "available": True,
+                "workerPath": "/notification-sw.js",
+                "vapidPublicKey": "sample-public-key",
+                "subject": "mailto:test@example.com",
+                "privateKeyPath": str(Path(temp_dir) / "test-private.pem"),
+            }
+            with mock.patch.object(app_module, "WEB_PUSH_SUBSCRIPTIONS_PATH", subscriptions_path):
+                app_module._save_push_subscriptions([sample_subscription])
+                with mock.patch.object(app_module, "get_web_push_config", return_value=push_config):
+                    with mock.patch.object(app_module, "webpush") as mocked_webpush:
+                        app_module._send_web_push_notification("title", "body", "success")
+
+        payload = json.loads(mocked_webpush.call_args.kwargs["data"])
+        self.assertEqual(payload["version"], app_module.SIGNAL_PUSH_PAYLOAD_VERSION)
 
     def test_notification_subscription_routes_roundtrip(self):
         sample_subscription = {

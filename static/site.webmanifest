@@ -1,0 +1,18 @@
+{
+  "name": "XAUUSD Predictor",
+  "short_name": "XAUUSD",
+  "description": "Live XAU/USD signal dashboard and push alerts.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0a0e1a",
+  "theme_color": "#d4af37",
+  "icons": [
+    {
+      "src": "/static/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

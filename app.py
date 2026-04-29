@@ -98,6 +98,8 @@ MAX_PUSH_ENDPOINT_BYTES = 2048
 MAX_PUSH_KEY_BYTES = 512
 MAX_PUSH_SUBSCRIPTIONS = 200
 NOTIFICATION_DEDUPE_SECONDS = 300
+ACTIVE_ACTION_STATES = {"LONG_ACTIVE", "SHORT_ACTIVE"}
+SIGNAL_PUSH_PAYLOAD_VERSION = "authoritative-signal-v1"
 
 latest_prediction = None
 last_update = None
@@ -350,28 +352,177 @@ def _normalize_signal_text(signal):
     return re.sub(r"\s+", " ", re.sub(r"\([^)]*\d[^)]*\)", "", str(signal or ""))).strip()
 
 
+def _finite_float(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _signal_score_threshold():
+    return float(DEFAULT_PARAMS.get("min_tradeability", 45))
+
+
+def _format_signal_number(value):
+    number = _finite_float(value)
+    if number is None:
+        return "--"
+    return str(int(number)) if number.is_integer() else f"{number:.1f}"
+
+
+def _prediction_score(prediction):
+    forecast = prediction.get("forecast") if isinstance(prediction.get("forecast"), dict) else {}
+    return _finite_float(forecast.get("score")) or 0.0
+
+
+def _valid_signal_risk(action_state, signal_price, stop_loss, take_profit):
+    if action_state == "LONG_ACTIVE":
+        return stop_loss < signal_price < take_profit
+    if action_state == "SHORT_ACTIVE":
+        return take_profit < signal_price < stop_loss
+    return False
+
+
+def _build_authoritative_signal_state(prediction, status=None):
+    """Single validated signal contract shared by dashboard rendering and push alerts."""
+    raw_blockers = prediction.get("blockers") if isinstance(prediction.get("blockers"), list) else []
+    blockers = [str(blocker) for blocker in raw_blockers if str(blocker).strip()]
+    score = _prediction_score(prediction)
+    threshold = _signal_score_threshold()
+    raw_action_state = prediction.get("actionState") or "WAIT"
+    raw_action = prediction.get("action") or "hold"
+    raw_verdict = prediction.get("verdict") or "Neutral"
+    tradeability_label = prediction.get("tradeabilityLabel") or "Low"
+    app_status = status or prediction.get("status") or "active"
+    signal_price = _finite_float(prediction.get("entryPrice"))
+    stop_loss = _finite_float(prediction.get("stopLoss"))
+    take_profit = _finite_float(prediction.get("takeProfit"))
+
+    suppression_reasons = []
+    if raw_action_state in ACTIVE_ACTION_STATES:
+        expected_verdict = "Bullish" if raw_action_state == "LONG_ACTIVE" else "Bearish"
+        expected_action = "buy" if raw_action_state == "LONG_ACTIVE" else "sell"
+
+        if blockers:
+            suppression_reasons.append("blockers present")
+        if raw_verdict != expected_verdict:
+            suppression_reasons.append(f"verdict {raw_verdict} is not {expected_verdict}")
+        if raw_action != expected_action:
+            suppression_reasons.append("dashboard would render Waiting for Signal")
+        if score < threshold:
+            suppression_reasons.append(
+                f"signal score {_format_signal_number(score)} below threshold {_format_signal_number(threshold)}"
+            )
+        if tradeability_label == "Low":
+            suppression_reasons.append("tradeability is Low")
+        if signal_price is None or signal_price <= 0:
+            suppression_reasons.append("signal price is unavailable")
+        if stop_loss is None or take_profit is None:
+            suppression_reasons.append("risk management is incomplete")
+        elif signal_price is not None and not _valid_signal_risk(
+            raw_action_state,
+            signal_price,
+            stop_loss,
+            take_profit,
+        ):
+            suppression_reasons.append("risk management values are invalid")
+        if app_status in {"initializing", "error"}:
+            suppression_reasons.append(f"app status is {app_status}")
+
+    active_trade = raw_action_state in ACTIVE_ACTION_STATES and not suppression_reasons
+    if active_trade:
+        action_state = raw_action_state
+        action = raw_action
+        verdict = raw_verdict
+        canonical_blockers = []
+        display_status = "Signal Active"
+    else:
+        action_state = "WAIT" if raw_action_state in ACTIVE_ACTION_STATES else raw_action_state
+        action = "hold" if raw_action_state in ACTIVE_ACTION_STATES else raw_action
+        verdict = "Neutral" if raw_action_state in ACTIVE_ACTION_STATES else raw_verdict
+        canonical_blockers = list(blockers)
+        for reason in suppression_reasons:
+            if reason not in canonical_blockers:
+                canonical_blockers.append(reason)
+        display_status = "Waiting for Signal" if action == "hold" else "Signal Blocked"
+
+    return {
+        "rawActionState": raw_action_state,
+        "rawAction": raw_action,
+        "rawVerdict": raw_verdict,
+        "actionState": action_state,
+        "action": action,
+        "verdict": verdict,
+        "tradeabilityLabel": tradeability_label,
+        "score": round(score, 2),
+        "threshold": threshold,
+        "blockers": canonical_blockers,
+        "activeTrade": active_trade,
+        "displayStatus": display_status,
+        "signalPrice": signal_price,
+        "stopLoss": stop_loss,
+        "takeProfit": take_profit,
+        "suppressionReasons": suppression_reasons,
+    }
+
+
+def _apply_authoritative_signal_state(prediction, status=None):
+    if not isinstance(prediction, dict) or prediction.get("error"):
+        return prediction
+
+    normalized = dict(prediction)
+    forecast = normalized.get("forecast") if isinstance(normalized.get("forecast"), dict) else {}
+    normalized["forecast"] = dict(forecast)
+    state = _build_authoritative_signal_state(normalized, status=status)
+
+    normalized["verdict"] = state["verdict"]
+    normalized["action"] = state["action"]
+    normalized["actionState"] = state["actionState"]
+    normalized["blockers"] = state["blockers"]
+    normalized["forecast"]["score"] = state["score"]
+    normalized["forecast"]["scoreThreshold"] = state["threshold"]
+    normalized["signalScoreThreshold"] = state["threshold"]
+    normalized["signalValidation"] = state
+
+    if state["rawActionState"] in ACTIVE_ACTION_STATES and not state["activeTrade"]:
+        normalized["entryPrice"] = None
+        normalized["stopLoss"] = None
+        normalized["takeProfit"] = None
+        normalized["slPips"] = None
+        normalized["tpPips"] = None
+
+    return normalized
+
+
 def _build_server_signal_snapshot(prediction):
     if not isinstance(prediction, dict) or prediction.get("error"):
         return None
 
-    signals = prediction.get("signals") if isinstance(prediction.get("signals"), list) else []
-    blockers = prediction.get("blockers") if isinstance(prediction.get("blockers"), list) else []
-    forecast = prediction.get("forecast") if isinstance(prediction.get("forecast"), dict) else {}
+    normalized = _apply_authoritative_signal_state(prediction)
+    validation = normalized.get("signalValidation") or {}
+    signals = normalized.get("signals") if isinstance(normalized.get("signals"), list) else []
+    blockers = validation.get("blockers") if isinstance(validation.get("blockers"), list) else []
 
-    confidence = float(prediction.get("confidence") or 0)
-    score = float(forecast.get("score") or 0)
+    confidence = _finite_float(normalized.get("confidence")) or 0.0
+    score = _finite_float(validation.get("score")) or _prediction_score(normalized)
 
     return {
-        "verdict": prediction.get("verdict") or "Neutral",
-        "action": prediction.get("action") or "hold",
-        "actionState": prediction.get("actionState") or "WAIT",
-        "tradeabilityLabel": prediction.get("tradeabilityLabel") or "Low",
+        "verdict": validation.get("verdict") or normalized.get("verdict") or "Neutral",
+        "action": validation.get("action") or normalized.get("action") or "hold",
+        "actionState": validation.get("actionState") or normalized.get("actionState") or "WAIT",
+        "tradeabilityLabel": validation.get("tradeabilityLabel") or normalized.get("tradeabilityLabel") or "Low",
         "confidence": confidence,
         "score": score,
+        "threshold": _finite_float(validation.get("threshold")) or _signal_score_threshold(),
         "signals": signals[:4],
         "signalsKey": "|".join(_normalize_signal_text(signal) for signal in signals[:4]),
         "hasBlockers": bool(blockers),
-        "timestamp": prediction.get("lastUpdate") or prediction.get("timestamp"),
+        "blockers": blockers,
+        "isActionable": bool(validation.get("activeTrade")),
+        "suppressionReasons": list(validation.get("suppressionReasons") or []),
+        "displayStatus": validation.get("displayStatus") or "Waiting for Signal",
+        "timestamp": normalized.get("lastUpdate") or normalized.get("timestamp"),
     }
 
 
@@ -388,7 +539,7 @@ def _build_server_alert_title(previous_snapshot, current_snapshot):
 
 
 def _is_actionable_signal_snapshot(snapshot):
-    if snapshot["hasBlockers"]:
+    if not snapshot.get("isActionable"):
         return False
     if snapshot["actionState"] == "LONG_ACTIVE":
         return snapshot["action"] == "buy" and snapshot["verdict"] == "Bullish"
@@ -405,6 +556,45 @@ def _is_pushworthy_signal_change(previous_snapshot, current_snapshot):
         return True
 
     return previous_actionable and current_snapshot["actionState"] == "WAIT"
+
+
+def _notification_suppression_reason(previous_snapshot, current_snapshot):
+    if previous_snapshot is None:
+        return "initial snapshot"
+    if current_snapshot["actionState"] in ACTIVE_ACTION_STATES and not current_snapshot.get("isActionable"):
+        reasons = current_snapshot.get("suppressionReasons") or []
+        return "; ".join(reasons) or "active signal failed validation"
+    if current_snapshot.get("hasBlockers"):
+        return "blockers present"
+    if current_snapshot.get("score", 0) < current_snapshot.get("threshold", _signal_score_threshold()):
+        return "score below threshold"
+    if current_snapshot.get("tradeabilityLabel") == "Low":
+        return "tradeability is Low"
+    if current_snapshot.get("displayStatus") == "Waiting for Signal":
+        return "dashboard would render Waiting for Signal"
+    return "not a push-worthy transition"
+
+
+def _log_signal_transition(previous_snapshot, current_snapshot, decision, reason):
+    if current_snapshot is None:
+        return
+
+    previous_state = previous_snapshot["actionState"] if previous_snapshot else "None"
+    previous_verdict = previous_snapshot["verdict"] if previous_snapshot else "None"
+    logger.info(
+        "Signal transition previous=%s next=%s bias=%s->%s score=%.2f threshold=%.2f "
+        "blockers=%s tradeability=%s notification=%s reason=%s",
+        previous_state,
+        current_snapshot["actionState"],
+        previous_verdict,
+        current_snapshot["verdict"],
+        current_snapshot.get("score", 0.0),
+        current_snapshot.get("threshold", _signal_score_threshold()),
+        current_snapshot.get("blockers", []),
+        current_snapshot.get("tradeabilityLabel"),
+        decision,
+        reason,
+    )
 
 
 def _describe_server_signal_change(previous_snapshot, current_snapshot):
@@ -518,6 +708,7 @@ def _send_web_push_notification(title, body, severity):
 
     payload = json.dumps(
         {
+            "version": SIGNAL_PUSH_PAYLOAD_VERSION,
             "title": title,
             "body": body,
             "url": "/",
@@ -568,14 +759,23 @@ def _notify_signal_change(prediction):
     previous_snapshot = last_push_snapshot
     last_push_snapshot = current_snapshot
     if previous_snapshot is None:
+        _log_signal_transition(previous_snapshot, current_snapshot, "suppressed", "initial snapshot")
         return
 
     change = _describe_server_signal_change(previous_snapshot, current_snapshot)
     if change is None:
+        _log_signal_transition(
+            previous_snapshot,
+            current_snapshot,
+            "suppressed",
+            _notification_suppression_reason(previous_snapshot, current_snapshot),
+        )
         return
     if not _should_send_signal_notification(current_snapshot):
+        _log_signal_transition(previous_snapshot, current_snapshot, "suppressed", "dedupe window")
         return
 
+    _log_signal_transition(previous_snapshot, current_snapshot, "sent", "push-worthy transition")
     _send_web_push_notification(change["title"], change["body"], change["severity"])
 
 
@@ -787,6 +987,7 @@ def generate_prediction(notify=True):
                 "timestamps": [timestamp.isoformat() for timestamp in recent_frame.index],
             }
 
+            prediction = _apply_authoritative_signal_state(prediction, status="active")
             latest_prediction = _json_safe(prediction)
             last_update = datetime.now(timezone.utc)
             error_state = None
@@ -912,6 +1113,7 @@ def api_prediction():
         "error": error_state if not has_usable_prediction else None,
         "warning": error_state if has_usable_prediction and error_state else None,
     }
+    response = _apply_authoritative_signal_state(response, status=status)
 
     return jsonify(_json_safe(response))
 

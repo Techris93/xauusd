@@ -1,3 +1,5 @@
+self.SIGNAL_PUSH_PAYLOAD_VERSION = "authoritative-signal-v1";
+
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());
 });
@@ -19,10 +21,19 @@ self.addEventListener("push", (event) => {
     }
   }
 
+  const tag = payload.tag || "xauusd-important-signal";
+  if (
+    tag === "xauusd-important-signal" &&
+    payload.version !== self.SIGNAL_PUSH_PAYLOAD_VERSION
+  ) {
+    console.warn("Ignoring stale signal push payload.");
+    return;
+  }
+
   const title = payload.title || "XAU/USD signal update";
   const options = {
     body: payload.body || "Important signal conditions changed.",
-    tag: payload.tag || "xauusd-important-signal",
+    tag: tag,
     renotify: true,
     requireInteraction: Boolean(payload.requireInteraction),
     data: {

@@ -511,7 +511,7 @@ def calculate_tradeability(score, direction, df, params, is_exit=False):
         label = "High" if tradeability >= 70 else "Medium"
         return tradeability, label, []
     else:
-        return tradeability, "Low", [f"Score {tradeability:.1f} below threshold {threshold}"]
+        return tradeability, "Low", [f"Tradeability {tradeability:.1f} below threshold {threshold}"]
 
 
 # ============================================

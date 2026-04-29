@@ -4,6 +4,9 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>XAUUSD Predictor</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+    <link rel="manifest" href="/static/site.webmanifest" />
+    <meta name="theme-color" content="#d4af37" />
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
       * {
@@ -716,27 +719,48 @@
           ? data.signals.slice(0, 4)
           : [];
         const normalizedSignals = signals.map(normalizeSignalText);
-        const blockers = Array.isArray(data.blockers) ? data.blockers : [];
+        const validation =
+          data.signalValidation && typeof data.signalValidation === "object"
+            ? data.signalValidation
+            : {};
+        const blockers = Array.isArray(validation.blockers)
+          ? validation.blockers
+          : Array.isArray(data.blockers)
+            ? data.blockers
+            : [];
         const confidence = Number.isFinite(Number(data.confidence))
           ? Number(data.confidence)
           : 0;
-        const score = Number.isFinite(
-          Number(data.forecast && data.forecast.score),
-        )
-          ? Number(data.forecast.score)
-          : 0;
+        const score = Number.isFinite(Number(validation.score))
+          ? Number(validation.score)
+          : Number.isFinite(Number(data.forecast && data.forecast.score))
+            ? Number(data.forecast.score)
+            : 0;
 
         return {
-          verdict: data.verdict || "Neutral",
-          action: data.action || "hold",
-          actionState: data.actionState || "WAIT",
-          tradeabilityLabel: data.tradeabilityLabel || "Low",
+          verdict: validation.verdict || data.verdict || "Neutral",
+          action: validation.action || data.action || "hold",
+          actionState: validation.actionState || data.actionState || "WAIT",
+          tradeabilityLabel:
+            validation.tradeabilityLabel || data.tradeabilityLabel || "Low",
           confidence: confidence,
           score: score,
           signals: signals,
           signalsKey: normalizedSignals.join("|"),
           hasBlockers: blockers.length > 0,
         };
+      }
+
+      function displayScore(data) {
+        const validation =
+          data && data.signalValidation && typeof data.signalValidation === "object"
+            ? data.signalValidation
+            : {};
+        return Number.isFinite(Number(validation.score))
+          ? Number(validation.score)
+          : Number.isFinite(Number(data && data.forecast && data.forecast.score))
+            ? Number(data.forecast.score)
+          : 0;
       }
 
       function buildAlertTitle(previous, current) {
@@ -1276,9 +1300,7 @@
 
         document.getElementById("tradeabilityScore").textContent =
           data.tradeabilityLabel || "Low";
-        document.getElementById("scoreValue").textContent = data.forecast
-          ? data.forecast.score
-          : "--";
+        document.getElementById("scoreValue").textContent = displayScore(data);
         document.getElementById("rrValue").textContent = data.rrRatio || "--";
 
         const signalList = document.getElementById("signalList");
