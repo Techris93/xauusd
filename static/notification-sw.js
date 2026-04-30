@@ -78,6 +78,19 @@ self.addEventListener("push", (event) => {
 
   event.waitUntil(
     (async () => {
+      if (tag === "xauusd-important-signal") {
+        const clients = await self.clients.matchAll({
+          type: "window",
+          includeUncontrolled: true,
+        });
+        for (const client of clients) {
+          client.postMessage({
+            type: "xauusd.signalPush",
+            createdAt: payload.createdAt || null,
+            snapshotId: payload.signalSnapshotId || null,
+          });
+        }
+      }
       await self.registration.showNotification(title, options);
     })(),
   );

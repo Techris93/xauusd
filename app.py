@@ -110,6 +110,10 @@ WEB_PUSH_NOTIFICATION_STATE_PATH = _runtime_path(
     "WEB_PUSH_NOTIFICATION_STATE_PATH",
     "runtime_webpush_notification_state.json",
 )
+WEB_PUSH_SIGNAL_SNAPSHOT_PATH = _runtime_path(
+    "WEB_PUSH_SIGNAL_SNAPSHOT_PATH",
+    "runtime_webpush_signal_snapshot.json",
+)
 MAX_NOTIFICATION_PAYLOAD_BYTES = 64 * 1024
 MAX_PUSH_ENDPOINT_BYTES = 2048
 MAX_PUSH_KEY_BYTES = 512
@@ -156,6 +160,7 @@ last_update = None
 last_price_update = None
 error_state = None
 last_push_snapshot = None
+last_notification_snapshot = None
 last_notification = {"key": None, "time": None}
 signal_stabilizer_state = {}
 active_trade_state = None
@@ -699,6 +704,27 @@ def _default_committed_signal(candidate):
     }
 
 
+def _restore_committed_from_notification_baseline(symbol, candidate):
+    previous_snapshot = _previous_notification_snapshot()
+    if not isinstance(previous_snapshot, dict):
+        return None
+    if previous_snapshot.get("actionState") not in ACTIVE_ACTION_STATES:
+        return None
+    if previous_snapshot.get("actionState") != candidate.get("actionState"):
+        return None
+    if candidate.get("actionState") not in ACTIVE_ACTION_STATES or not candidate.get("activeTrade"):
+        return None
+    if previous_snapshot.get("isActionable") is False:
+        return None
+
+    logger.info(
+        "Restoring committed signal from persisted notification baseline symbol=%s action=%s",
+        symbol,
+        candidate.get("actionState"),
+    )
+    return dict(candidate)
+
+
 def _transition_identity(fields):
     if fields["actionState"] in ACTIVE_ACTION_STATES:
         return fields["actionState"]
@@ -918,7 +944,13 @@ def _stabilize_signal_transition(prediction, now=None, advance=True):
 
     with stabilizer_lock:
         state = signal_stabilizer_state.setdefault(symbol, {})
-        committed = state.get("committed") or _default_committed_signal(candidate)
+        committed = state.get("committed")
+        if committed is None:
+            committed = _restore_committed_from_notification_baseline(symbol, candidate)
+            if committed is not None and advance:
+                state["committed"] = committed
+                state["pending"] = None
+        committed = committed or _default_committed_signal(candidate)
         previous_committed = committed
 
         snapshot_timestamp = candidate.get("snapshotTimestamp")
@@ -1287,6 +1319,38 @@ def _latest_notification_state():
     return last_notification
 
 
+def _load_last_notification_snapshot():
+    payload = _read_json_file(WEB_PUSH_SIGNAL_SNAPSHOT_PATH, default=None)
+    return payload if isinstance(payload, dict) else None
+
+
+def _save_last_notification_snapshot(snapshot):
+    if not isinstance(snapshot, dict):
+        return
+    try:
+        _write_json_file(WEB_PUSH_SIGNAL_SNAPSHOT_PATH, _json_safe(snapshot), mode=0o600)
+    except Exception as exc:
+        logger.warning("Failed to persist notification snapshot state: %s", exc)
+
+
+def _previous_notification_snapshot():
+    if isinstance(last_notification_snapshot, dict):
+        return last_notification_snapshot
+    persisted = _load_last_notification_snapshot()
+    if isinstance(persisted, dict):
+        return persisted
+    return last_push_snapshot if isinstance(last_push_snapshot, dict) else None
+
+
+def _set_notification_snapshot(snapshot):
+    global last_notification_snapshot
+
+    if not isinstance(snapshot, dict):
+        return
+    last_notification_snapshot = dict(snapshot)
+    _save_last_notification_snapshot(last_notification_snapshot)
+
+
 def _should_send_signal_notification(current_snapshot, now=None):
     global last_notification
 
@@ -1602,6 +1666,7 @@ def _commit_risk_exit(active_signal, current_price, reason, timestamp, notify=Tr
         latest_prediction["activeSignal"] = _json_safe(closed_active_signal)
         last_update = timestamp
         last_push_snapshot = _build_server_signal_snapshot(latest_prediction)
+        _set_notification_snapshot(last_push_snapshot)
 
     title, body, severity = _risk_exit_notification(reason, closed_active_signal, current_price)
     logger.info(
@@ -1665,6 +1730,8 @@ def _remember_signal_snapshot(prediction):
     if current_snapshot is None:
         return None
     last_push_snapshot = current_snapshot
+    if current_snapshot.get("notificationAllowed", True) or _previous_notification_snapshot() is None:
+        _set_notification_snapshot(current_snapshot)
     _sync_active_trade_state(stabilized_prediction)
     return current_snapshot
 
@@ -1677,15 +1744,26 @@ def _notify_signal_change(prediction):
     if current_snapshot is None:
         return
 
-    previous_snapshot = last_push_snapshot
+    previous_snapshot = _previous_notification_snapshot()
     last_push_snapshot = current_snapshot
     _sync_active_trade_state(stabilized_prediction)
     if previous_snapshot is None:
+        _set_notification_snapshot(current_snapshot)
         _log_signal_transition(previous_snapshot, current_snapshot, "suppressed", "initial snapshot")
+        return
+
+    if not current_snapshot.get("notificationAllowed", True):
+        _log_signal_transition(
+            previous_snapshot,
+            current_snapshot,
+            "suppressed",
+            _notification_suppression_reason(previous_snapshot, current_snapshot),
+        )
         return
 
     change = _describe_server_signal_change(previous_snapshot, current_snapshot)
     if change is None:
+        _set_notification_snapshot(current_snapshot)
         _log_signal_transition(
             previous_snapshot,
             current_snapshot,
@@ -1694,9 +1772,11 @@ def _notify_signal_change(prediction):
         )
         return
     if not _should_send_signal_notification(current_snapshot):
+        _set_notification_snapshot(current_snapshot)
         _log_signal_transition(previous_snapshot, current_snapshot, "suppressed", "dedupe window")
         return
 
+    _set_notification_snapshot(current_snapshot)
     _log_signal_transition(previous_snapshot, current_snapshot, "sent", "push-worthy transition")
     _send_web_push_notification(change["title"], change["body"], change["severity"])
 
@@ -2199,10 +2279,12 @@ def generate_prediction(notify=True):
         except Exception as exc:
             logger.error("Prediction error: %s", exc)
             error_state = str(exc)
-            last_update = datetime.now(timezone.utc)
             if _has_usable_prediction():
-                logger.warning("Keeping last successful prediction after refresh failure.")
+                logger.warning(
+                    "Keeping last successful prediction after refresh failure; prediction timestamp unchanged."
+                )
                 return
+            last_update = datetime.now(timezone.utc)
             latest_prediction = {
                 "verdict": "Neutral",
                 "confidence": 50,
@@ -2309,6 +2391,10 @@ def api_prediction():
         "error": error_state if not has_usable_prediction else None,
         "warning": error_state if has_usable_prediction and error_state else None,
     }
+    if last_update is not None:
+        response["predictionUpdatedAt"] = response.get("predictionUpdatedAt") or last_update.isoformat()
+    if last_price_update is not None:
+        response["priceUpdatedAt"] = last_price_update.isoformat()
     response = _ensure_stabilized_signal_prediction(response, status=status, advance=False)
     response = _attach_runtime_state(response)
 

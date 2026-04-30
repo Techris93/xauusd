@@ -36,6 +36,7 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.last_price_update = None
         app_module.error_state = None
         app_module.last_push_snapshot = None
+        app_module.last_notification_snapshot = None
         app_module.last_notification = {"key": None, "time": None}
         app_module.signal_stabilizer_state = {}
         app_module.active_trade_state = None
@@ -49,7 +50,9 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.bar_state = {}
         app_module.get_web_push_config.cache_clear()
         Path(app_module.WEB_PUSH_NOTIFICATION_STATE_PATH).unlink(missing_ok=True)
+        Path(app_module.WEB_PUSH_SIGNAL_SNAPSHOT_PATH).unlink(missing_ok=True)
         signal_state.reset()
+        self.timestamp_base = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=120)
         self.client = app_module.app.test_client()
 
     def tearDown(self):
@@ -58,6 +61,7 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.last_price_update = None
         app_module.error_state = None
         app_module.last_push_snapshot = None
+        app_module.last_notification_snapshot = None
         app_module.last_notification = {"key": None, "time": None}
         app_module.signal_stabilizer_state = {}
         app_module.active_trade_state = None
@@ -71,6 +75,7 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.bar_state = {}
         app_module.get_web_push_config.cache_clear()
         Path(app_module.WEB_PUSH_NOTIFICATION_STATE_PATH).unlink(missing_ok=True)
+        Path(app_module.WEB_PUSH_SIGNAL_SNAPSHOT_PATH).unlink(missing_ok=True)
         signal_state.reset()
 
     @staticmethod
@@ -221,12 +226,8 @@ class PredictorRegressionTests(unittest.TestCase):
         payload.update(overrides)
         return pd.DataFrame(payload, index=index)
 
-    @staticmethod
-    def iso_at(offset_seconds):
-        return (
-            datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
-            + timedelta(seconds=offset_seconds)
-        ).isoformat()
+    def iso_at(self, offset_seconds):
+        return (self.timestamp_base + timedelta(seconds=offset_seconds)).isoformat()
 
     @staticmethod
     def fixed_datetime(fixed_now):
@@ -777,6 +778,8 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIsNone(payload.get("error"))
         self.assertIn("rate limited", payload.get("warning"))
         self.assertEqual(payload.get("currentPrice"), 2500.12)
+        self.assertEqual(app_module.last_update, fresh_time)
+        self.assertEqual(payload.get("predictionUpdatedAt"), fresh_iso)
 
     def test_request_driven_prediction_refresh_updates_snapshot_without_push(self):
         frame = self.build_frame(volume=0.0)
@@ -815,6 +818,29 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(app_module.latest_prediction["priceUpdatedAt"], price_time.isoformat())
         self.assertEqual(app_module.last_update, prediction_time)
         self.assertEqual(app_module.last_price_update, price_time)
+
+    def test_prediction_endpoint_exposes_distinct_prediction_and_price_timestamps(self):
+        prediction_time = datetime(2026, 4, 30, 10, 0, tzinfo=timezone.utc)
+        price_time = datetime(2026, 4, 30, 10, 2, tzinfo=timezone.utc)
+        app_module.latest_prediction = {
+            "verdict": "Neutral",
+            "confidence": 62,
+            "currentPrice": 4621.71,
+            "timestamp": prediction_time.isoformat(),
+            "lastUpdate": prediction_time.isoformat(),
+            "dataSource": "Twelve Data",
+            "symbol": app_module.DEFAULT_SYMBOL,
+            "forecast": {"score": 23.48},
+        }
+        app_module.last_update = prediction_time
+        app_module.last_price_update = price_time
+
+        response = self.client.get("/api/prediction")
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload.get("predictionUpdatedAt"), prediction_time.isoformat())
+        self.assertEqual(payload.get("priceUpdatedAt"), price_time.isoformat())
 
     def test_bar_open_generate_uses_intrabar_candle_but_preserves_active_signal_during_grace(self):
         fixed_now = datetime(2026, 4, 30, 9, 1, tzinfo=timezone.utc)
@@ -1037,6 +1063,9 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIn("Ignoring stale signal push payload", response_body)
         self.assertIn("Ignoring expired signal push payload", response_body)
         self.assertIn("Ignoring duplicate signal push payload", response_body)
+        self.assertIn('self.clients.matchAll', response_body)
+        self.assertIn('type: "xauusd.signalPush"', response_body)
+        self.assertIn("client.postMessage", response_body)
 
     def test_dashboard_does_not_show_duplicate_in_app_signal_toasts(self):
         response = self.client.get("/")
@@ -1072,6 +1101,20 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIn("fetchSequence < latestRenderedFetchSequence", response_body)
         self.assertIn("data.calculation_time", response_body)
         self.assertIn("data.signalValidation && data.signalValidation.calculationTime", response_body)
+
+    def test_dashboard_separates_prediction_and_price_update_times(self):
+        response = self.client.get("/")
+        response_body = response.get_data(as_text=True)
+        response.close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Prediction Update", response_body)
+        self.assertIn('id="priceUpdate"', response_body)
+        self.assertIn("Price Update", response_body)
+        self.assertIn("data.priceUpdatedAt || data.price_updated_at", response_body)
+        self.assertIn('message.type === "xauusd.signalPush"', response_body)
+        self.assertIn('window.addEventListener("focus", fetchPrediction)', response_body)
+        self.assertIn('window.addEventListener("online", fetchPrediction)', response_body)
 
     def test_dashboard_sends_stable_push_client_id_with_subscription(self):
         response = self.client.get("/")
@@ -1176,6 +1219,105 @@ class PredictorRegressionTests(unittest.TestCase):
                         now=now + timedelta(minutes=1),
                     )
                 )
+
+    def test_active_signal_after_restart_uses_persisted_baseline_without_replay(self):
+        active_snapshot = {
+            **self.wait_snapshot(has_blockers=False),
+            "actionState": "SHORT_ACTIVE",
+            "action": "sell",
+            "verdict": "Bearish",
+            "tradeabilityLabel": "High",
+            "confidence": 82.0,
+            "score": 80.0,
+            "signals": ["Bearish structure break"],
+            "signalsKey": "Bearish structure break",
+            "isActionable": True,
+            "notificationAllowed": True,
+            "displayStatus": "Signal Active",
+            "timestamp": self.iso_at(100),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = str(Path(temp_dir) / "signal_snapshot.json")
+            state_path = str(Path(temp_dir) / "notification_state.json")
+            with mock.patch.object(app_module, "WEB_PUSH_SIGNAL_SNAPSHOT_PATH", snapshot_path):
+                with mock.patch.object(app_module, "WEB_PUSH_NOTIFICATION_STATE_PATH", state_path):
+                    app_module._set_notification_snapshot(active_snapshot)
+                    app_module.last_notification_snapshot = None
+                    app_module.last_push_snapshot = None
+                    app_module.signal_stabilizer_state = {}
+
+                    with mock.patch.object(
+                        app_module,
+                        "datetime",
+                        self.fixed_datetime(datetime(2026, 4, 30, 12, 2, tzinfo=timezone.utc)),
+                    ):
+                        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+                            app_module._notify_signal_change(
+                                self.active_prediction("SHORT_ACTIVE", score=80, timestamp=self.iso_at(101))
+                            )
+                            mocked_push.assert_not_called()
+                            self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
+                            self.assertEqual(
+                                app_module._load_last_notification_snapshot()["actionState"],
+                                "SHORT_ACTIVE",
+                            )
+
+                            app_module._notify_signal_change(
+                                self.active_prediction("SHORT_ACTIVE", score=80, timestamp=self.iso_at(102))
+                            )
+                            mocked_push.assert_not_called()
+
+                    persisted_snapshot = app_module._load_last_notification_snapshot()
+
+        self.assertEqual(persisted_snapshot["actionState"], "SHORT_ACTIVE")
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
+
+    def test_wait_after_restart_from_persisted_active_sends_pause_notification(self):
+        active_snapshot = {
+            **self.wait_snapshot(has_blockers=False),
+            "actionState": "SHORT_ACTIVE",
+            "action": "sell",
+            "verdict": "Bearish",
+            "tradeabilityLabel": "High",
+            "confidence": 82.0,
+            "score": 80.0,
+            "signals": ["Bearish structure break"],
+            "signalsKey": "Bearish structure break",
+            "isActionable": True,
+            "notificationAllowed": True,
+            "displayStatus": "Signal Active",
+            "timestamp": self.iso_at(100),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = str(Path(temp_dir) / "signal_snapshot.json")
+            state_path = str(Path(temp_dir) / "notification_state.json")
+            with mock.patch.object(app_module, "WEB_PUSH_SIGNAL_SNAPSHOT_PATH", snapshot_path):
+                with mock.patch.object(app_module, "WEB_PUSH_NOTIFICATION_STATE_PATH", state_path):
+                    app_module._set_notification_snapshot(active_snapshot)
+                    app_module.last_notification_snapshot = None
+                    app_module.last_push_snapshot = None
+                    app_module.signal_stabilizer_state = {}
+
+                    with mock.patch.object(
+                        app_module,
+                        "datetime",
+                        self.fixed_datetime(datetime(2026, 4, 30, 12, 2, tzinfo=timezone.utc)),
+                    ):
+                        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+                            app_module._notify_signal_change(
+                                self.wait_prediction(
+                                    score=23.48,
+                                    blockers=["Tradeability 21.1 below threshold 45"],
+                                    timestamp=self.iso_at(101),
+                                )
+                            )
+
+        mocked_push.assert_called_once()
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD signal paused")
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertEqual(app_module.last_notification_snapshot["actionState"], "WAIT")
 
     def test_subscription_upsert_replaces_previous_endpoint_for_same_client_id(self):
         first_subscription = {

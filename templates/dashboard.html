@@ -549,7 +549,11 @@
           </div>
           <div class="price-item">
             <div class="price-value" id="lastUpdate">--</div>
-            <div class="price-label">Last Update</div>
+            <div class="price-label">Prediction Update</div>
+          </div>
+          <div class="price-item">
+            <div class="price-value" id="priceUpdate">--</div>
+            <div class="price-label">Price Update</div>
           </div>
         </div>
         <div id="barGraceStatus" class="bar-grace-status" style="display: none"></div>
@@ -1272,6 +1276,23 @@
         }
       }
 
+      if ("serviceWorker" in navigator) {
+        navigator.serviceWorker.addEventListener("message", (event) => {
+          const message = event.data || {};
+          if (message.type === "xauusd.signalPush") {
+            fetchPrediction();
+          }
+        });
+      }
+
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+          fetchPrediction();
+        }
+      });
+      window.addEventListener("focus", fetchPrediction);
+      window.addEventListener("online", fetchPrediction);
+
       function updateDashboard(data) {
         document.getElementById("loadingState").style.display = "none";
         document.getElementById("mainContent").style.display = "block";
@@ -1320,6 +1341,13 @@
         document.getElementById("lastUpdate").textContent = predictionUpdatedAt
           ? new Date(predictionUpdatedAt).toLocaleTimeString()
           : "--";
+        const priceUpdatedAt = data.priceUpdatedAt || data.price_updated_at;
+        const priceUpdateEl = document.getElementById("priceUpdate");
+        if (priceUpdateEl) {
+          priceUpdateEl.textContent = priceUpdatedAt
+            ? new Date(priceUpdatedAt).toLocaleTimeString()
+            : "--";
+        }
 
         const verdictEl = document.getElementById("verdictText");
         verdictEl.textContent = signalSnapshot.verdict || "Neutral";
