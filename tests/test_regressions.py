@@ -206,6 +206,19 @@ class PredictorRegressionTests(unittest.TestCase):
             + timedelta(seconds=offset_seconds)
         ).isoformat()
 
+    @staticmethod
+    def fixed_datetime(fixed_now):
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+
+            @classmethod
+            def fromisoformat(cls, value):
+                return datetime.fromisoformat(value)
+
+        return FixedDatetime
+
     def test_prepare_data_assigns_nearest_levels_without_existing_columns(self):
         prepared = prepare_data(self.build_frame())
 
@@ -319,6 +332,56 @@ class PredictorRegressionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Latest Twelve Data candle is stale"):
             app_module._validate_latest_candle_freshness(normalized, "1h")
+
+    def test_get_last_closed_candle_excludes_new_hour_at_0901(self):
+        index = pd.DatetimeIndex(
+            [
+                pd.Timestamp("2026-04-30T07:00:00Z"),
+                pd.Timestamp("2026-04-30T08:00:00Z"),
+                pd.Timestamp("2026-04-30T09:00:00Z"),
+            ]
+        )
+        frame = app_module.normalize_ohlcv_frame(self.ohlcv_frame(index=index))
+        now = datetime(2026, 4, 30, 9, 1, tzinfo=timezone.utc)
+
+        last_closed = app_module.get_last_closed_candle(frame, "1h", now)
+        closed_frame, metadata = app_module.build_closed_candle_signal_frame(frame, "1h", now=now)
+
+        self.assertEqual(last_closed, pd.Timestamp("2026-04-30T08:00:00Z"))
+        self.assertEqual(closed_frame.index[-1], pd.Timestamp("2026-04-30T08:00:00Z"))
+        self.assertNotIn(pd.Timestamp("2026-04-30T09:00:00Z"), closed_frame.index)
+        self.assertTrue(metadata["candle_is_closed"])
+        self.assertTrue(metadata["grace_period_active"])
+        self.assertEqual(metadata["candle_used_for_signal"], "2026-04-30T08:00:00+00:00")
+
+    def test_incomplete_single_tick_current_candle_is_ignored(self):
+        index = pd.DatetimeIndex(
+            [
+                pd.Timestamp("2026-04-30T07:00:00Z"),
+                pd.Timestamp("2026-04-30T08:00:00Z"),
+                pd.Timestamp("2026-04-30T09:00:00Z"),
+            ]
+        )
+        frame = app_module.normalize_ohlcv_frame(
+            self.ohlcv_frame(
+                index=index,
+                Open=[2400.0, 2401.0, 2402.0],
+                High=[2401.0, 2402.0, 2402.0],
+                Low=[2399.0, 2400.0, 2402.0],
+                Close=[2400.5, 2401.5, 2402.0],
+                Volume=[1000.0, 1000.0, 1.0],
+            )
+        )
+
+        closed_frame, metadata = app_module.build_closed_candle_signal_frame(
+            frame,
+            "1h",
+            now=datetime(2026, 4, 30, 9, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(closed_frame.index[-1], pd.Timestamp("2026-04-30T08:00:00Z"))
+        self.assertTrue(metadata["excluded_current_candle"])
+        self.assertEqual(metadata["excluded_single_tick_count"], 1)
 
     def test_stop_loss_take_profit_uses_fallback_for_corrupted_high_atr(self):
         sl, tp, sl_pips, tp_pips = calculate_stop_loss_take_profit(
@@ -518,6 +581,18 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(second_prediction["verdict"], "Bullish")
         self.assertIsNone(second_prediction["antiFlipReason"])
 
+    def test_signal_engine_refuses_frame_marked_as_incomplete_candle(self):
+        frame = self.build_signal_frame()
+        frame.attrs["candle_is_closed"] = False
+        frame.attrs["signal_snapshot_id"] = "incomplete-engine-frame"
+
+        prediction = signal_module.compute_prediction(frame, app_module.DEFAULT_PARAMS)
+
+        self.assertEqual(prediction["actionState"], "WAIT")
+        self.assertEqual(prediction["verdict"], "Neutral")
+        self.assertIn("suppressed_incomplete_candle", prediction["blockers"])
+        self.assertEqual(prediction["signal_snapshot_id"], "incomplete-engine-frame")
+
     def test_signal_cooldown_blocks_immediate_opposite_flip(self):
         frame = self.build_signal_frame()
 
@@ -594,6 +669,16 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(len(chart_data.get("prices", [])), 50)
         self.assertEqual(len(chart_data.get("timestamps", [])), 50)
         self.assertFalse(any(value is None for value in chart_data.get("vwap", [])))
+        for field in [
+            "signal_snapshot_id",
+            "calculation_time",
+            "last_closed_candle_time",
+            "candle_used_for_signal",
+            "candle_is_closed",
+            "grace_period_active",
+        ]:
+            self.assertIn(field, payload)
+        self.assertTrue(payload["candle_is_closed"])
 
     def test_prediction_endpoint_refreshes_stale_cache_on_request(self):
         stale_time = datetime.now(timezone.utc) - timedelta(minutes=30)
@@ -672,6 +757,66 @@ class PredictorRegressionTests(unittest.TestCase):
 
         self.assertIsNotNone(app_module.last_push_snapshot)
         mocked_push.assert_not_called()
+
+    def test_bar_open_generate_uses_last_closed_candle_for_signal_calculation(self):
+        fixed_now = datetime(2026, 4, 30, 9, 1, tzinfo=timezone.utc)
+        index = pd.date_range(
+            end=pd.Timestamp("2026-04-30T09:00:00Z"),
+            periods=120,
+            freq="h",
+            tz="UTC",
+        )
+        frame = self.build_frame(index=index)
+        frame.iloc[-1, frame.columns.get_loc("Open")] = 2402.0
+        frame.iloc[-1, frame.columns.get_loc("High")] = 2402.0
+        frame.iloc[-1, frame.columns.get_loc("Low")] = 2402.0
+        frame.iloc[-1, frame.columns.get_loc("Close")] = 2402.0
+        frame.iloc[-1, frame.columns.get_loc("Volume")] = 1.0
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(
+                self.active_prediction(
+                    "SHORT_ACTIVE",
+                    score=72,
+                    timestamp="2026-04-30T08:58:00+00:00",
+                    candle_timestamp="2026-04-30T07:00:00+00:00",
+                )
+            )
+            app_module._notify_signal_change(
+                self.active_prediction(
+                    "SHORT_ACTIVE",
+                    score=72,
+                    timestamp="2026-04-30T08:59:00+00:00",
+                    candle_timestamp="2026-04-30T07:00:00+00:00",
+                )
+            )
+            self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
+            mocked_push.reset_mock()
+
+            def fake_compute(closed_df, params=None):
+                self.assertEqual(closed_df.index[-1], pd.Timestamp("2026-04-30T08:00:00Z"))
+                self.assertNotIn(pd.Timestamp("2026-04-30T09:00:00Z"), closed_df.index)
+                self.assertEqual(
+                    closed_df.attrs.get("candle_used_for_signal"),
+                    "2026-04-30T08:00:00+00:00",
+                )
+                return self.active_prediction(
+                    "SHORT_ACTIVE",
+                    score=72,
+                    timestamp=fixed_now.isoformat(),
+                    candle_timestamp="2026-04-30T08:00:00+00:00",
+                )
+
+            with mock.patch.object(app_module, "datetime", self.fixed_datetime(fixed_now)):
+                with mock.patch.object(app_module, "fetch_xauusd_data", return_value=frame.copy()):
+                    with mock.patch.object(app_module, "fetch_live_price", return_value=None):
+                        with mock.patch.object(app_module, "compute_prediction", side_effect=fake_compute):
+                            app_module.generate_prediction()
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.latest_prediction["actionState"], "SHORT_ACTIVE")
+        self.assertEqual(app_module.latest_prediction["candle_used_for_signal"], "2026-04-30T08:00:00+00:00")
+        self.assertTrue(app_module.latest_prediction["grace_period_active"])
 
     def test_notification_service_worker_route_is_available(self):
         response = self.client.get("/notification-sw.js")
@@ -1067,6 +1212,76 @@ class PredictorRegressionTests(unittest.TestCase):
 
         mocked_push.assert_not_called()
         self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
+
+    def test_bar_open_grace_suppresses_active_pause_for_both_directions(self):
+        for action_state in ("LONG_ACTIVE", "SHORT_ACTIVE"):
+            with self.subTest(action_state=action_state):
+                self.tearDown()
+                self.setUp()
+                app_module.last_push_snapshot = self.wait_snapshot()
+
+                with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+                    app_module._notify_signal_change(
+                        self.active_prediction(action_state, score=72, timestamp=self.iso_at(1))
+                    )
+                    app_module._notify_signal_change(
+                        self.active_prediction(action_state, score=72, timestamp=self.iso_at(2))
+                    )
+                    self.assertEqual(app_module.last_push_snapshot["actionState"], action_state)
+                    mocked_push.reset_mock()
+
+                    weak_prediction = self.wait_prediction(
+                        score=25,
+                        timestamp=self.iso_at(61),
+                        candle_timestamp=self.iso_at(0),
+                    )
+                    weak_prediction.update(
+                        {
+                            "signal_snapshot_id": f"{action_state}-bar-open",
+                            "calculation_time": self.iso_at(61),
+                            "latest_provider_candle_time": self.iso_at(60),
+                            "last_closed_candle_time": self.iso_at(0),
+                            "candle_used_for_signal": self.iso_at(0),
+                            "candle_is_closed": True,
+                            "grace_period_active": True,
+                        }
+                    )
+                    app_module._notify_signal_change(weak_prediction)
+
+                mocked_push.assert_not_called()
+                self.assertEqual(app_module.last_push_snapshot["actionState"], action_state)
+                self.assertFalse(app_module.last_push_snapshot["notificationAllowed"])
+                self.assertIn(
+                    "suppressed_bar_open_instability",
+                    app_module.last_push_snapshot["suppressionReasons"],
+                )
+
+    def test_incomplete_candle_snapshot_suppresses_active_pause(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(2)))
+            mocked_push.reset_mock()
+
+            weak_prediction = self.wait_prediction(score=25, timestamp=self.iso_at(3), candle_timestamp=self.iso_at(3))
+            weak_prediction.update(
+                {
+                    "signal_snapshot_id": "incomplete-candle",
+                    "calculation_time": self.iso_at(3),
+                    "latest_provider_candle_time": self.iso_at(3),
+                    "last_closed_candle_time": self.iso_at(2),
+                    "candle_used_for_signal": self.iso_at(3),
+                    "candle_is_closed": False,
+                    "grace_period_active": False,
+                }
+            )
+            app_module._notify_signal_change(weak_prediction)
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
+        self.assertFalse(app_module.last_push_snapshot["notificationAllowed"])
+        self.assertIn("suppressed_incomplete_candle", app_module.last_push_snapshot["suppressionReasons"])
 
     def test_single_snapshot_blocker_does_not_pause_active_trade(self):
         app_module.last_push_snapshot = self.wait_snapshot()

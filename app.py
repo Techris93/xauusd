@@ -51,6 +51,18 @@ def _read_prediction_refresh_seconds():
         )
         return 5
 
+
+def _read_bar_open_grace_seconds():
+    raw_value = os.getenv("SIGNAL_BAR_OPEN_GRACE_SECONDS", "120").strip()
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        logger.warning(
+            "Invalid bar-open grace period %r; defaulting to 120 seconds.",
+            raw_value,
+        )
+        return 120
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
@@ -100,9 +112,19 @@ MAX_PUSH_KEY_BYTES = 512
 MAX_PUSH_SUBSCRIPTIONS = 200
 NOTIFICATION_DEDUPE_SECONDS = 300
 ACTIVE_ACTION_STATES = {"LONG_ACTIVE", "SHORT_ACTIVE"}
+SIGNAL_SNAPSHOT_METADATA_FIELDS = (
+    "signal_snapshot_id",
+    "calculation_time",
+    "latest_provider_candle_time",
+    "last_closed_candle_time",
+    "candle_used_for_signal",
+    "candle_is_closed",
+    "grace_period_active",
+)
 SIGNAL_PUSH_PAYLOAD_VERSION = "authoritative-signal-v2"
 SIGNAL_PUSH_MAX_AGE_SECONDS = 300
 MAX_OHLC_RANGE_RATIO = 0.20
+BAR_OPEN_GRACE_SECONDS = _read_bar_open_grace_seconds()
 SIGNAL_STABILIZATION_CONFIG = {
     "activation_score_threshold": float(DEFAULT_PARAMS.get("min_tradeability", 45)),
     "deactivation_score_threshold": 40,
@@ -467,6 +489,7 @@ def _build_authoritative_signal_state(prediction, status=None):
     signal_price = _finite_float(prediction.get("entryPrice"))
     stop_loss = _finite_float(prediction.get("stopLoss"))
     take_profit = _finite_float(prediction.get("takeProfit"))
+    candle_is_closed = prediction.get("candle_is_closed", True) is not False
 
     suppression_reasons = []
     if raw_action_state in ACTIVE_ACTION_STATES:
@@ -496,6 +519,8 @@ def _build_authoritative_signal_state(prediction, status=None):
             take_profit,
         ):
             suppression_reasons.append("risk management values are invalid")
+        if not candle_is_closed:
+            suppression_reasons.append("suppressed_incomplete_candle")
         if app_status != "active":
             suppression_reasons.append(f"app status is {app_status}")
 
@@ -534,6 +559,8 @@ def _build_authoritative_signal_state(prediction, status=None):
         "takeProfit": take_profit,
         "suppressionReasons": suppression_reasons,
         "dataStatus": app_status,
+        "candleIsClosed": candle_is_closed,
+        "gracePeriodActive": bool(prediction.get("grace_period_active")),
     }
 
 
@@ -546,8 +573,14 @@ def _candidate_signal_fields(prediction):
     if score is None:
         score = _prediction_score(prediction)
     confidence = _finite_float(prediction.get("confidence")) or 50.0
+    candle_is_closed = validation.get("candleIsClosed")
+    if candle_is_closed is None:
+        candle_is_closed = prediction.get("candle_is_closed", True) is not False
+    grace_period_active = validation.get("gracePeriodActive")
+    if grace_period_active is None:
+        grace_period_active = bool(prediction.get("grace_period_active"))
 
-    return {
+    fields = {
         "symbol": _prediction_symbol(prediction),
         "actionState": action_state,
         "direction": _direction_for_action_state(action_state),
@@ -572,7 +605,12 @@ def _candidate_signal_fields(prediction):
         "snapshotTimestamp": _prediction_timestamp(prediction),
         "candleTimestamp": _prediction_candle_timestamp(prediction),
         "dataStatus": validation.get("dataStatus") or prediction.get("status") or "active",
+        "candleIsClosed": bool(candle_is_closed),
+        "gracePeriodActive": bool(grace_period_active),
     }
+    for field in SIGNAL_SNAPSHOT_METADATA_FIELDS:
+        fields[field] = prediction.get(field)
+    return fields
 
 
 def _default_committed_signal(candidate):
@@ -698,6 +736,9 @@ def _compose_stabilized_prediction(prediction, committed, candidate, pending, tr
     stabilized["forecast"]["scoreThreshold"] = committed["threshold"]
     stabilized["forecast"]["rawCandidateScore"] = candidate["score"]
     stabilized["signalScoreThreshold"] = committed["threshold"]
+    for field in SIGNAL_SNAPSHOT_METADATA_FIELDS:
+        if field in candidate:
+            stabilized[field] = candidate.get(field)
 
     pending_candidate = pending.get("candidate") if pending else None
     pending_state = pending_candidate.get("actionState") if pending_candidate else None
@@ -725,6 +766,8 @@ def _compose_stabilized_prediction(prediction, committed, candidate, pending, tr
         "takeProfit": committed.get("takeProfit"),
         "suppressionReasons": [] if transition_allowed else [reason],
         "dataStatus": candidate.get("dataStatus"),
+        "candleIsClosed": candidate.get("candleIsClosed", True),
+        "gracePeriodActive": candidate.get("gracePeriodActive", False),
         "candidateState": candidate["actionState"],
         "candidateSignal": candidate["actionState"],
         "candidateDirection": candidate["direction"],
@@ -732,6 +775,8 @@ def _compose_stabilized_prediction(prediction, committed, candidate, pending, tr
         "candidateScore": candidate["score"],
         "candidateConfidence": candidate["confidence"],
         "candidateBlockers": list(candidate.get("blockers") or []),
+        "candidateCandleIsClosed": candidate.get("candleIsClosed", True),
+        "candidateGracePeriodActive": candidate.get("gracePeriodActive", False),
         "committedState": committed["actionState"],
         "committedSignal": committed["actionState"],
         "committedDirection": committed["direction"],
@@ -748,6 +793,11 @@ def _compose_stabilized_prediction(prediction, committed, candidate, pending, tr
         "suppressionOrWaitReason": reason,
         "snapshotTimestamp": candidate.get("timestamp"),
         "candleTimestamp": candidate.get("candleTimestamp").isoformat() if candidate.get("candleTimestamp") else None,
+        "signalSnapshotId": candidate.get("signal_snapshot_id"),
+        "calculationTime": candidate.get("calculation_time"),
+        "latestProviderCandleTime": candidate.get("latest_provider_candle_time"),
+        "lastClosedCandleTime": candidate.get("last_closed_candle_time"),
+        "candleUsedForSignal": candidate.get("candle_used_for_signal"),
     }
     return stabilized
 
@@ -830,6 +880,27 @@ def _stabilize_signal_transition(prediction, now=None, advance=True):
             pending = state.get("pending")
             _log_stabilization_decision(symbol, committed, candidate, pending, False, reason)
             return _compose_stabilized_prediction(prediction, committed, candidate, pending, False, reason)
+
+        if committed["actionState"] in ACTIVE_ACTION_STATES and candidate["actionState"] == "WAIT":
+            if candidate.get("gracePeriodActive") or not candidate.get("candleIsClosed", True):
+                reason = (
+                    "suppressed_incomplete_candle"
+                    if not candidate.get("candleIsClosed", True)
+                    else "suppressed_bar_open_instability"
+                )
+                pending = state.get("pending")
+                if advance:
+                    state["lastSnapshotTimestamp"] = snapshot_timestamp or now
+                _log_stabilization_decision(
+                    symbol,
+                    committed,
+                    candidate,
+                    pending,
+                    False,
+                    reason,
+                    next_committed=committed,
+                )
+                return _compose_stabilized_prediction(prediction, committed, candidate, pending, False, reason)
 
         if committed["actionState"] in ACTIVE_ACTION_STATES and candidate["actionState"] == "WAIT":
             if (
@@ -975,6 +1046,13 @@ def _build_server_signal_snapshot(prediction):
         "suppressionReasons": list(validation.get("suppressionReasons") or []),
         "displayStatus": validation.get("displayStatus") or "Waiting for Signal",
         "dataStatus": validation.get("dataStatus") or "active",
+        "signalSnapshotId": validation.get("signalSnapshotId") or normalized.get("signal_snapshot_id"),
+        "calculationTime": validation.get("calculationTime") or normalized.get("calculation_time"),
+        "latestProviderCandleTime": validation.get("latestProviderCandleTime") or normalized.get("latest_provider_candle_time"),
+        "lastClosedCandleTime": validation.get("lastClosedCandleTime") or normalized.get("last_closed_candle_time"),
+        "candleUsedForSignal": validation.get("candleUsedForSignal") or normalized.get("candle_used_for_signal"),
+        "candleIsClosed": bool(validation.get("candleIsClosed", normalized.get("candle_is_closed", True))),
+        "gracePeriodActive": bool(validation.get("gracePeriodActive", normalized.get("grace_period_active", False))),
         "timestamp": normalized.get("lastUpdate") or normalized.get("timestamp"),
     }
 
@@ -1017,6 +1095,13 @@ def _is_pushworthy_signal_change(previous_snapshot, current_snapshot):
 def _notification_suppression_reason(previous_snapshot, current_snapshot):
     if previous_snapshot is None:
         return "initial snapshot"
+    if not current_snapshot.get("candleIsClosed", True):
+        return "suppressed_incomplete_candle"
+    if current_snapshot.get("gracePeriodActive") and current_snapshot.get("actionState") in ACTIVE_ACTION_STATES:
+        return "suppressed_bar_open_instability"
+    if not current_snapshot.get("notificationAllowed", True):
+        reasons = current_snapshot.get("suppressionReasons") or []
+        return "; ".join(reasons) or "notification suppressed by signal stabilizer"
     if current_snapshot["actionState"] in ACTIVE_ACTION_STATES and not current_snapshot.get("isActionable"):
         reasons = current_snapshot.get("suppressionReasons") or []
         return "; ".join(reasons) or "active signal failed validation"
@@ -1410,6 +1495,142 @@ def _validate_latest_candle_freshness(df, interval):
         )
 
 
+def _coerce_utc_datetime(value):
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return datetime.now(timezone.utc)
+
+
+def _current_candle_open(timeframe, now=None):
+    now = _coerce_utc_datetime(now or datetime.now(timezone.utc))
+    duration = _interval_duration(interval_to_twelvedata(timeframe))
+    if duration is None:
+        return None
+
+    duration_seconds = int(duration.total_seconds())
+    if duration_seconds <= 0:
+        return None
+
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    elapsed_seconds = int((now - epoch).total_seconds())
+    open_seconds = elapsed_seconds - (elapsed_seconds % duration_seconds)
+    return epoch + timedelta(seconds=open_seconds)
+
+
+def get_last_closed_candle(df, timeframe, now=None):
+    """Return the latest candle-open timestamp that is fully closed for now/timeframe."""
+    if df is None or df.empty:
+        return None
+
+    current_open = _current_candle_open(timeframe, now)
+    if current_open is None:
+        return df.index[-1]
+
+    current_open = pd.Timestamp(current_open)
+    closed_index = df.index[df.index < current_open]
+    return closed_index[-1] if len(closed_index) else None
+
+
+def _bar_open_grace_period_active(timeframe, now=None):
+    if BAR_OPEN_GRACE_SECONDS <= 0:
+        return False
+
+    now = _coerce_utc_datetime(now or datetime.now(timezone.utc))
+    current_open = _current_candle_open(timeframe, now)
+    if current_open is None:
+        return False
+
+    elapsed_seconds = (now - current_open).total_seconds()
+    return 0 <= elapsed_seconds < BAR_OPEN_GRACE_SECONDS
+
+
+def _single_tick_candle_shape(row):
+    try:
+        open_price = float(row["Open"])
+        high_price = float(row["High"])
+        low_price = float(row["Low"])
+        close_price = float(row["Close"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    if not all(math.isfinite(value) for value in [open_price, high_price, low_price, close_price]):
+        return False
+    identical_ohlc = open_price == high_price == low_price == close_price
+    volume = _finite_float(row.get("Volume"))
+    return identical_ohlc and (volume is None or volume <= 1)
+
+
+def build_closed_candle_signal_frame(df, timeframe=DEFAULT_INTERVAL, now=None):
+    """Return only fully closed candles plus metadata for signal snapshot integrity."""
+    if df is None or df.empty:
+        raise ValueError("No candles available for closed-candle signal calculation")
+
+    now = _coerce_utc_datetime(now or datetime.now(timezone.utc))
+    latest_provider_timestamp = df.index[-1]
+    current_open = _current_candle_open(timeframe, now)
+    last_closed_timestamp = get_last_closed_candle(df, timeframe, now)
+    if last_closed_timestamp is None:
+        raise ValueError("No fully closed candles available for signal calculation")
+
+    closed_frame = df.loc[df.index <= last_closed_timestamp].copy()
+    if closed_frame.empty:
+        raise ValueError("Closed-candle signal frame is empty")
+
+    forming_frame = df.loc[df.index > last_closed_timestamp]
+    excluded_current_candle = not forming_frame.empty
+    excluded_single_tick_count = int(
+        sum(_single_tick_candle_shape(row) for _, row in forming_frame.iterrows())
+    )
+    candle_is_closed = current_open is None or pd.Timestamp(last_closed_timestamp) < pd.Timestamp(current_open)
+    grace_period_active = _bar_open_grace_period_active(timeframe, now)
+
+    calculation_time = now.isoformat()
+    last_closed_iso = last_closed_timestamp.isoformat()
+    latest_provider_iso = latest_provider_timestamp.isoformat()
+    snapshot_id = "|".join(
+        [
+            str(DEFAULT_SYMBOL),
+            str(timeframe),
+            calculation_time,
+            last_closed_iso,
+        ]
+    )
+
+    logger.info(
+        "Closed-candle selection now=%s timeframe=%s latest_provider_candle=%s "
+        "current_candle_open=%s last_closed_candle=%s excluded_current_candle=%s "
+        "excluded_single_tick_count=%s candle_is_closed=%s grace_period_active=%s rows=%s",
+        calculation_time,
+        timeframe,
+        latest_provider_iso,
+        current_open.isoformat() if current_open else None,
+        last_closed_iso,
+        excluded_current_candle,
+        excluded_single_tick_count,
+        candle_is_closed,
+        grace_period_active,
+        len(closed_frame),
+    )
+
+    metadata = {
+        "signal_snapshot_id": snapshot_id,
+        "calculation_time": calculation_time,
+        "latest_provider_candle_time": latest_provider_iso,
+        "last_closed_candle_time": last_closed_iso,
+        "candle_used_for_signal": last_closed_iso,
+        "candle_is_closed": bool(candle_is_closed),
+        "grace_period_active": bool(grace_period_active),
+        "excluded_current_candle": excluded_current_candle,
+        "excluded_single_tick_count": excluded_single_tick_count,
+    }
+    closed_frame.attrs.update(metadata)
+    return closed_frame, metadata
+
+
 def normalize_ohlcv_frame(frame):
     if frame is None or frame.empty:
         return pd.DataFrame()
@@ -1495,12 +1716,18 @@ def generate_prediction(notify=True):
 
     with prediction_refresh_lock:
         try:
-            df = fetch_xauusd_data(period=DEFAULT_PERIOD, interval=DEFAULT_INTERVAL)
-            df = prepare_data(df, params=DEFAULT_PARAMS)
+            provider_df = fetch_xauusd_data(period=DEFAULT_PERIOD, interval=DEFAULT_INTERVAL)
+            now = datetime.now(timezone.utc)
+            signal_frame, signal_metadata = build_closed_candle_signal_frame(
+                provider_df,
+                DEFAULT_INTERVAL,
+                now=now,
+            )
+            df = prepare_data(signal_frame, params=DEFAULT_PARAMS)
 
             prediction = compute_prediction(df, params=DEFAULT_PARAMS)
             live_price = fetch_live_price()
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = now.isoformat()
             recent_frame = df.tail(50)
 
             if live_price is not None:
@@ -1509,9 +1736,11 @@ def generate_prediction(notify=True):
             prediction["timestamp"] = now_iso
             prediction["lastUpdate"] = now_iso
             prediction["dataPoints"] = len(df)
+            prediction["providerDataPoints"] = len(provider_df)
             prediction["timeframe"] = DEFAULT_INTERVAL
             prediction["dataSource"] = "Twelve Data"
             prediction["symbol"] = DEFAULT_SYMBOL
+            prediction.update(signal_metadata)
             prediction["chartData"] = {
                 "prices": recent_frame["Close"].tolist(),
                 "highs": recent_frame["High"].tolist(),
@@ -1536,9 +1765,13 @@ def generate_prediction(notify=True):
                 _remember_signal_snapshot(latest_prediction)
 
             logger.info(
-                "Prediction generated from Twelve Data: %s @ %s%%",
+                "Prediction generated from Twelve Data: %s @ %s%% snapshot=%s "
+                "last_closed_candle=%s grace_period_active=%s",
                 prediction["verdict"],
                 prediction["confidence"],
+                prediction.get("signal_snapshot_id"),
+                prediction.get("last_closed_candle_time"),
+                prediction.get("grace_period_active"),
             )
 
         except Exception as exc:

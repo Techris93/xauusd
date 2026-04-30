@@ -58,6 +58,20 @@ DEFAULT_PARAMS = {
 
 
 ACTIVE_SIGNALS = {"LONG_ACTIVE", "SHORT_ACTIVE"}
+SIGNAL_METADATA_FIELDS = (
+    "signal_snapshot_id",
+    "calculation_time",
+    "latest_provider_candle_time",
+    "last_closed_candle_time",
+    "candle_used_for_signal",
+    "candle_is_closed",
+    "grace_period_active",
+)
+
+
+def _frame_signal_metadata(df):
+    attrs = getattr(df, "attrs", {}) or {}
+    return {field: attrs[field] for field in SIGNAL_METADATA_FIELDS if field in attrs}
 
 
 def _signal_for_direction(direction):
@@ -697,11 +711,48 @@ def calculate_stop_loss_take_profit(current_price, direction, df, params):
 def compute_prediction(df, params=None):
     """
     Main prediction function - streamlined and fixed.
+    The caller must pass a frame of fully closed candles; incomplete-candle
+    metadata is treated as a hard WAIT guard so partial bars cannot score trades.
     """
     params = {**DEFAULT_PARAMS, **(params or {})}
+    signal_metadata = _frame_signal_metadata(df)
+
+    if signal_metadata.get("candle_is_closed") is False:
+        return {
+            **signal_metadata,
+            "verdict": "Neutral",
+            "confidence": 50,
+            "tradeability": 0,
+            "tradeabilityScore": 0,
+            "tradeabilityLabel": "Low",
+            "action": "hold",
+            "actionState": "WAIT",
+            "reason": "Incomplete candle excluded from signal calculation",
+            "blockers": ["suppressed_incomplete_candle"],
+            "signals": [],
+            "currentPrice": None,
+            "entryPrice": None,
+            "stopLoss": None,
+            "takeProfit": None,
+            "slPips": None,
+            "tpPips": None,
+            "rrRatio": None,
+            "forecast": {
+                "directionalBias": "Neutral",
+                "confidence": 50,
+                "score": 0,
+                "signals": [],
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "signalState": signal_state.current_signal,
+            "holdTimeMinutes": signal_state.hold_time_minutes(),
+            "flipsToday": signal_state.flip_count,
+            "antiFlipReason": "suppressed_incomplete_candle",
+        }
 
     if df.empty or len(df) < 20:
         return {
+            **signal_metadata,
             "verdict": "Neutral",
             "confidence": 50,
             "tradeability": 0,
@@ -764,7 +815,7 @@ def compute_prediction(df, params=None):
         "signals": signals
     }
 
-    return {
+    result = {
         "verdict": verdict,
         "confidence": confidence,
         "tradeabilityScore": round(tradeability, 2),
@@ -790,6 +841,8 @@ def compute_prediction(df, params=None):
         "oppositeBars": signal_state.consecutive_opposite_bars,
         "antiFlipReason": final_blockers[0] if held and final_blockers else None,
     }
+    result.update(signal_metadata)
+    return result
 
 
 # ============================================
@@ -802,7 +855,9 @@ def prepare_data(df, params=None):
     Removed: complex regime calculations, 50+ feature annotations
     """
     params = {**DEFAULT_PARAMS, **(params or {})}
+    source_attrs = dict(getattr(df, "attrs", {}) or {})
     frame = df.copy().sort_index()
+    frame.attrs.update(source_attrs)
 
     # Ensure numeric
     for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
@@ -880,5 +935,6 @@ def prepare_data(df, params=None):
 
     frame.iat[-1, frame.columns.get_loc('nearest_support')] = nearest_support
     frame.iat[-1, frame.columns.get_loc('nearest_resistance')] = nearest_resistance
+    frame.attrs.update(source_attrs)
 
     return frame
