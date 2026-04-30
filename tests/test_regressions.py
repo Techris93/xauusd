@@ -243,22 +243,37 @@ class PredictorRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Out-of-order candle timestamps"):
             app_module.normalize_ohlcv_frame(self.ohlcv_frame(index=index))
 
-    def test_normalize_ohlcv_frame_rejects_non_finite_ohlc_values(self):
+    def test_normalize_ohlcv_frame_drops_non_finite_ohlc_values(self):
         frame = self.ohlcv_frame(Close=[2400.5, float("nan"), 2402.5])
 
-        with self.assertRaisesRegex(ValueError, "Non-finite OHLC values"):
-            app_module.normalize_ohlcv_frame(frame)
+        normalized = app_module.normalize_ohlcv_frame(frame)
 
-    def test_normalize_ohlcv_frame_rejects_invalid_ohlc_range(self):
+        self.assertEqual(len(normalized), 2)
+        self.assertFalse(normalized["Close"].isna().any())
+
+    def test_normalize_ohlcv_frame_drops_invalid_ohlc_range(self):
         frame = self.ohlcv_frame(High=[2401.0, 2399.0, 2403.0])
 
-        with self.assertRaisesRegex(ValueError, "Invalid OHLC candle range"):
-            app_module.normalize_ohlcv_frame(frame)
+        normalized = app_module.normalize_ohlcv_frame(frame)
 
-    def test_normalize_ohlcv_frame_rejects_absurd_ohlc_range(self):
+        self.assertEqual(len(normalized), 2)
+        self.assertTrue((normalized["High"] >= normalized["Close"]).all())
+
+    def test_normalize_ohlcv_frame_drops_absurd_ohlc_range(self):
         frame = self.ohlcv_frame(High=[2401.0, 3500.0, 2403.0], Low=[2399.0, 1000.0, 2401.0])
 
-        with self.assertRaisesRegex(ValueError, "Absurd OHLC candle range"):
+        normalized = app_module.normalize_ohlcv_frame(frame)
+
+        self.assertEqual(len(normalized), 2)
+        self.assertLessEqual(
+            (normalized["High"] - normalized["Low"]).max(),
+            normalized["Close"].abs().max() * app_module.MAX_OHLC_RANGE_RATIO,
+        )
+
+    def test_normalize_ohlcv_frame_rejects_all_malformed_ohlc_rows(self):
+        frame = self.ohlcv_frame(High=[3500.0, 3500.0, 3500.0], Low=[1000.0, 1000.0, 1000.0])
+
+        with self.assertRaisesRegex(ValueError, "No valid OHLC candles remained"):
             app_module.normalize_ohlcv_frame(frame)
 
     def test_latest_candle_freshness_rejects_stale_hourly_candle(self):

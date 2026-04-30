@@ -889,6 +889,8 @@ def _validate_ohlcv_quality(df):
     missing_columns = [column for column in required_columns if column not in df.columns]
     if missing_columns:
         raise ValueError(f"Missing OHLC columns from Twelve Data: {', '.join(missing_columns)}")
+    if df.empty:
+        raise ValueError("No OHLC candles returned by Twelve Data")
 
     if df.index.has_duplicates:
         raise ValueError("Duplicate candle timestamps returned by Twelve Data")
@@ -897,13 +899,7 @@ def _validate_ohlcv_quality(df):
 
     ohlc = df[required_columns]
     finite_mask = np.isfinite(ohlc.to_numpy(dtype=float)).all(axis=1)
-    if not bool(finite_mask.all()):
-        raise ValueError("Non-finite OHLC values returned by Twelve Data")
-
     positive_mask = (ohlc > 0).all(axis=1)
-    if not bool(positive_mask.all()):
-        raise ValueError("Non-positive OHLC values returned by Twelve Data")
-
     range_mask = (
         (df["High"] >= df["Low"])
         & (df["High"] >= df["Open"])
@@ -911,12 +907,21 @@ def _validate_ohlcv_quality(df):
         & (df["Low"] <= df["Open"])
         & (df["Low"] <= df["Close"])
     )
-    if not bool(range_mask.all()):
-        raise ValueError("Invalid OHLC candle range returned by Twelve Data")
-
     candle_range = df["High"] - df["Low"]
-    if not bool((candle_range <= df["Close"].abs() * MAX_OHLC_RANGE_RATIO).all()):
-        raise ValueError("Absurd OHLC candle range returned by Twelve Data")
+    sane_range_mask = candle_range <= df["Close"].abs() * MAX_OHLC_RANGE_RATIO
+    valid_mask = finite_mask & positive_mask & range_mask & sane_range_mask
+
+    rejected_count = int((~valid_mask).sum())
+    if rejected_count:
+        logger.warning(
+            "Rejected %s malformed Twelve Data OHLC candles before signal calculation.",
+            rejected_count,
+        )
+
+    filtered = df.loc[valid_mask].copy()
+    if filtered.empty:
+        raise ValueError("No valid OHLC candles remained after Twelve Data quality checks")
+    return filtered
 
 
 def _interval_duration(interval):
@@ -975,7 +980,7 @@ def normalize_ohlcv_frame(frame):
         df.index = df.index.tz_convert(TD_OUTPUT_TIMEZONE)
 
     df = df[~df.index.isna()]
-    _validate_ohlcv_quality(df)
+    df = _validate_ohlcv_quality(df)
 
     if "Volume" not in df.columns:
         df["Volume"] = 0.0
