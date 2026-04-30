@@ -48,6 +48,7 @@ class PredictorRegressionTests(unittest.TestCase):
         }
         app_module.bar_state = {}
         app_module.get_web_push_config.cache_clear()
+        Path(app_module.WEB_PUSH_NOTIFICATION_STATE_PATH).unlink(missing_ok=True)
         signal_state.reset()
         self.client = app_module.app.test_client()
 
@@ -69,6 +70,7 @@ class PredictorRegressionTests(unittest.TestCase):
         }
         app_module.bar_state = {}
         app_module.get_web_push_config.cache_clear()
+        Path(app_module.WEB_PUSH_NOTIFICATION_STATE_PATH).unlink(missing_ok=True)
         signal_state.reset()
 
     @staticmethod
@@ -1034,6 +1036,7 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIn("SIGNAL_PUSH_PAYLOAD_VERSION", response_body)
         self.assertIn("Ignoring stale signal push payload", response_body)
         self.assertIn("Ignoring expired signal push payload", response_body)
+        self.assertIn("Ignoring duplicate signal push payload", response_body)
 
     def test_dashboard_does_not_show_duplicate_in_app_signal_toasts(self):
         response = self.client.get("/")
@@ -1067,6 +1070,18 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIn('cache: "no-store"', response_body)
         self.assertIn('"Cache-Control": "no-cache"', response_body)
         self.assertIn("fetchSequence < latestRenderedFetchSequence", response_body)
+        self.assertIn("data.calculation_time", response_body)
+        self.assertIn("data.signalValidation && data.signalValidation.calculationTime", response_body)
+
+    def test_dashboard_sends_stable_push_client_id_with_subscription(self):
+        response = self.client.get("/")
+        response_body = response.get_data(as_text=True)
+        response.close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('const PUSH_CLIENT_ID_KEY = "xauusd.pushClientId"', response_body)
+        self.assertIn("function getPushClientId()", response_body)
+        self.assertIn("clientId: getPushClientId()", response_body)
 
     def test_dashboard_declares_favicon_and_manifest(self):
         response = self.client.get("/")
@@ -1138,6 +1153,64 @@ class PredictorRegressionTests(unittest.TestCase):
             app_module._notify_signal_change(prediction(["Bullish continuation"], 95, confidence=96))
 
         self.assertEqual(mocked_push.call_count, 1)
+
+    def test_signal_notification_dedupe_survives_process_state_reset(self):
+        snapshot = {
+            **self.wait_snapshot(has_blockers=False),
+            "actionState": "LONG_ACTIVE",
+            "action": "buy",
+            "verdict": "Bullish",
+            "tradeabilityLabel": "Medium",
+            "isActionable": True,
+        }
+        now = datetime(2026, 4, 30, 12, 6, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = str(Path(temp_dir) / "notification_state.json")
+            with mock.patch.object(app_module, "WEB_PUSH_NOTIFICATION_STATE_PATH", state_path):
+                self.assertTrue(app_module._should_send_signal_notification(snapshot, now=now))
+                app_module.last_notification = {"key": None, "time": None}
+                self.assertFalse(
+                    app_module._should_send_signal_notification(
+                        snapshot,
+                        now=now + timedelta(minutes=1),
+                    )
+                )
+
+    def test_subscription_upsert_replaces_previous_endpoint_for_same_client_id(self):
+        first_subscription = {
+            "endpoint": "https://example.com/subscriptions/device-old",
+            "expirationTime": None,
+            "keys": {
+                "p256dh": "sample-p256dh-key-old",
+                "auth": "sample-auth-key-old",
+            },
+        }
+        second_subscription = {
+            "endpoint": "https://example.com/subscriptions/device-new",
+            "expirationTime": None,
+            "keys": {
+                "p256dh": "sample-p256dh-key-new",
+                "auth": "sample-auth-key-new",
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            subscriptions_path = str(Path(temp_dir) / "push_subscriptions.json")
+            with mock.patch.object(app_module, "WEB_PUSH_SUBSCRIPTIONS_PATH", subscriptions_path):
+                self.assertEqual(
+                    app_module._upsert_push_subscription(first_subscription, client_id="device-123"),
+                    1,
+                )
+                self.assertEqual(
+                    app_module._upsert_push_subscription(second_subscription, client_id="device-123"),
+                    1,
+                )
+                subscriptions = app_module._load_push_subscriptions()
+
+        self.assertEqual(len(subscriptions), 1)
+        self.assertEqual(subscriptions[0]["endpoint"], second_subscription["endpoint"])
+        self.assertEqual(subscriptions[0]["clientId"], "device-123")
 
     def test_cooldown_blocked_wait_prediction_does_not_send_active_push(self):
         app_module.last_push_snapshot = self.wait_snapshot(score=80.0, has_blockers=False)
@@ -1799,6 +1872,7 @@ class PredictorRegressionTests(unittest.TestCase):
         payload = json.loads(mocked_webpush.call_args.kwargs["data"])
         self.assertEqual(payload["version"], app_module.SIGNAL_PUSH_PAYLOAD_VERSION)
         self.assertEqual(payload["maxAgeSeconds"], app_module.SIGNAL_PUSH_MAX_AGE_SECONDS)
+        self.assertEqual(payload["dedupeKey"], "title|body")
         self.assertIsNotNone(datetime.fromisoformat(payload["createdAt"]))
 
     def test_notification_subscription_routes_roundtrip(self):
@@ -1833,11 +1907,11 @@ class PredictorRegressionTests(unittest.TestCase):
                 ):
                     subscribe_response = self.client.post(
                         "/api/notifications/subscribe",
-                        json={"subscription": sample_subscription},
+                        json={"subscription": sample_subscription, "clientId": "device-123"},
                     )
                     duplicate_response = self.client.post(
                         "/api/notifications/subscribe",
-                        json={"subscription": sample_subscription},
+                        json={"subscription": sample_subscription, "clientId": "device-123"},
                     )
                     unsubscribe_response = self.client.post(
                         "/api/notifications/unsubscribe",

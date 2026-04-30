@@ -630,6 +630,7 @@
 
     <script>
       const ALERT_STORAGE_KEY = "xauusd.pushAlertsEnabled";
+      const PUSH_CLIENT_ID_KEY = "xauusd.pushClientId";
 
       let priceChart = null;
       let refreshInterval = null;
@@ -643,6 +644,18 @@
       let alertsEnabled =
         localStorage.getItem(ALERT_STORAGE_KEY) === "true" ||
         localStorage.getItem("xauusd.browserAlertsEnabled") === "true";
+
+      function getPushClientId() {
+        let clientId = localStorage.getItem(PUSH_CLIENT_ID_KEY);
+        if (!clientId) {
+          clientId =
+            window.crypto && typeof window.crypto.randomUUID === "function"
+              ? window.crypto.randomUUID()
+              : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+          localStorage.setItem(PUSH_CLIENT_ID_KEY, clientId);
+        }
+        return clientId;
+      }
 
       function persistAlertPreference(enabled) {
         alertsEnabled = enabled;
@@ -971,7 +984,10 @@
         const response = await fetch("/api/notifications/subscribe", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ subscription: subscription }),
+          body: JSON.stringify({
+            subscription: subscription,
+            clientId: getPushClientId(),
+          }),
         });
         const payload = await response.json().catch(() => ({}));
         if (!response.ok || !payload.ok) {
@@ -1296,7 +1312,11 @@
           ? "$" + data.entryPrice.toLocaleString()
           : "--";
         const predictionUpdatedAt =
-          data.predictionUpdatedAt || data.lastUpdate || data.timestamp;
+          data.predictionUpdatedAt ||
+          data.calculation_time ||
+          (data.signalValidation && data.signalValidation.calculationTime) ||
+          data.lastUpdate ||
+          data.timestamp;
         document.getElementById("lastUpdate").textContent = predictionUpdatedAt
           ? new Date(predictionUpdatedAt).toLocaleTimeString()
           : "--";

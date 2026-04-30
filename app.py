@@ -106,9 +106,14 @@ WEB_PUSH_VAPID_PEM_PATH = _runtime_path(
     "WEB_PUSH_VAPID_PEM_PATH",
     "runtime_webpush_vapid_private.pem",
 )
+WEB_PUSH_NOTIFICATION_STATE_PATH = _runtime_path(
+    "WEB_PUSH_NOTIFICATION_STATE_PATH",
+    "runtime_webpush_notification_state.json",
+)
 MAX_NOTIFICATION_PAYLOAD_BYTES = 64 * 1024
 MAX_PUSH_ENDPOINT_BYTES = 2048
 MAX_PUSH_KEY_BYTES = 512
+MAX_PUSH_CLIENT_ID_BYTES = 128
 MAX_PUSH_SUBSCRIPTIONS = 200
 NOTIFICATION_DEDUPE_SECONDS = 300
 ACTIVE_ACTION_STATES = {"LONG_ACTIVE", "SHORT_ACTIVE"}
@@ -347,7 +352,18 @@ def _save_push_subscriptions(subscriptions):
     _write_json_file(WEB_PUSH_SUBSCRIPTIONS_PATH, subscriptions, mode=0o600)
 
 
-def _normalize_push_subscription(subscription):
+def _sanitize_push_client_id(client_id):
+    client_id = str(client_id or "").strip()
+    if not client_id:
+        return None
+    if len(client_id.encode("utf-8")) > MAX_PUSH_CLIENT_ID_BYTES:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", client_id):
+        return None
+    return client_id
+
+
+def _normalize_push_subscription(subscription, client_id=None):
     if not isinstance(subscription, dict):
         return None
 
@@ -373,7 +389,7 @@ def _normalize_push_subscription(subscription):
     if expiration_time is not None and not isinstance(expiration_time, (int, float)):
         expiration_time = None
 
-    return {
+    normalized = {
         "endpoint": endpoint,
         "expirationTime": expiration_time,
         "keys": {
@@ -381,18 +397,26 @@ def _normalize_push_subscription(subscription):
             "auth": auth,
         },
     }
+    sanitized_client_id = _sanitize_push_client_id(
+        client_id or subscription.get("clientId") or subscription.get("client_id")
+    )
+    if sanitized_client_id:
+        normalized["clientId"] = sanitized_client_id
+    return normalized
 
 
-def _upsert_push_subscription(subscription):
-    normalized = _normalize_push_subscription(subscription)
+def _upsert_push_subscription(subscription, client_id=None):
+    normalized = _normalize_push_subscription(subscription, client_id=client_id)
     if normalized is None:
         raise ValueError("Invalid push subscription payload")
 
     with push_lock:
+        client_id = normalized.get("clientId")
         subscriptions = [
             item
             for item in _load_push_subscriptions()
             if item.get("endpoint") != normalized["endpoint"]
+            and (not client_id or item.get("clientId") != client_id)
         ]
         if len(subscriptions) >= MAX_PUSH_SUBSCRIPTIONS:
             raise ValueError("Push subscription limit reached")
@@ -1232,13 +1256,46 @@ def _notification_dedupe_key(snapshot):
     )
 
 
+def _load_last_notification_state():
+    payload = _read_json_file(WEB_PUSH_NOTIFICATION_STATE_PATH, default={})
+    if not isinstance(payload, dict):
+        return {"key": None, "time": None}
+
+    return {
+        "key": str(payload.get("key") or "") or None,
+        "time": _parse_datetime(payload.get("time")),
+    }
+
+
+def _save_last_notification_state(state):
+    payload = {
+        "key": state.get("key"),
+        "time": state.get("time").isoformat() if state.get("time") else None,
+    }
+    try:
+        _write_json_file(WEB_PUSH_NOTIFICATION_STATE_PATH, payload, mode=0o600)
+    except Exception as exc:
+        logger.warning("Failed to persist notification dedupe state: %s", exc)
+
+
+def _latest_notification_state():
+    persisted = _load_last_notification_state()
+    in_memory_time = last_notification.get("time")
+    persisted_time = persisted.get("time")
+    if persisted_time and (in_memory_time is None or persisted_time > in_memory_time):
+        return persisted
+    return last_notification
+
+
 def _should_send_signal_notification(current_snapshot, now=None):
     global last_notification
 
     now = now or datetime.now(timezone.utc)
     key = _notification_dedupe_key(current_snapshot)
-    last_key = last_notification.get("key")
-    last_time = last_notification.get("time")
+    previous_notification = _latest_notification_state()
+    last_key = previous_notification.get("key")
+    last_time = previous_notification.get("time")
+    last_notification = previous_notification
 
     if (
         key == last_key
@@ -1249,6 +1306,7 @@ def _should_send_signal_notification(current_snapshot, now=None):
         return False
 
     last_notification = {"key": key, "time": now}
+    _save_last_notification_state(last_notification)
     return True
 
 
@@ -1298,6 +1356,7 @@ def _send_web_push_notification(title, body, severity):
             "maxAgeSeconds": SIGNAL_PUSH_MAX_AGE_SECONDS,
             "title": title,
             "body": body,
+            "dedupeKey": f"{title}|{body}",
             "url": "/",
             "tag": "xauusd-important-signal",
             "requireInteraction": severity in {"success", "error"},
@@ -2196,8 +2255,9 @@ def notification_subscribe():
 
     payload = request.get_json(silent=True) or {}
     subscription = payload.get("subscription") or payload
+    client_id = payload.get("clientId") or payload.get("client_id")
     try:
-        subscriber_count = _upsert_push_subscription(subscription)
+        subscriber_count = _upsert_push_subscription(subscription, client_id=client_id)
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
 

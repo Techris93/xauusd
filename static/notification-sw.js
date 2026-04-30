@@ -1,4 +1,5 @@
 self.SIGNAL_PUSH_PAYLOAD_VERSION = "authoritative-signal-v2";
+self.lastSignalPush = null;
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());
@@ -44,8 +45,29 @@ self.addEventListener("push", (event) => {
   }
 
   const title = payload.title || "XAU/USD signal update";
+  const body = payload.body || "Important signal conditions changed.";
+  if (tag === "xauusd-important-signal") {
+    const dedupeKey = payload.dedupeKey || `${title}|${body}`;
+    const lastPush = self.lastSignalPush;
+    const duplicateWindowSeconds = Number.isFinite(Number(payload.maxAgeSeconds))
+      ? Number(payload.maxAgeSeconds)
+      : 300;
+    if (
+      lastPush &&
+      lastPush.key === dedupeKey &&
+      Date.now() - lastPush.time < duplicateWindowSeconds * 1000
+    ) {
+      console.warn("Ignoring duplicate signal push payload.");
+      return;
+    }
+    self.lastSignalPush = {
+      key: dedupeKey,
+      time: Date.now(),
+    };
+  }
+
   const options = {
-    body: payload.body || "Important signal conditions changed.",
+    body: body,
     tag: tag,
     renotify: true,
     requireInteraction: Boolean(payload.requireInteraction),
