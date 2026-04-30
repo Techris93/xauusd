@@ -970,6 +970,48 @@ class PredictorRegressionTests(unittest.TestCase):
         mocked_push.assert_called_once()
         self.assertEqual(app_module.risk_state["exitReason"], "SL_HIT")
 
+    def test_same_active_signal_does_not_move_open_trade_risk_levels(self):
+        with mock.patch.object(app_module, "_send_web_push_notification"):
+            app_module._notify_signal_change(
+                self.active_prediction(
+                    "LONG_ACTIVE",
+                    score=72,
+                    timestamp=self.iso_at(1),
+                )
+            )
+            app_module._notify_signal_change(
+                self.active_prediction(
+                    "LONG_ACTIVE",
+                    score=72,
+                    timestamp=self.iso_at(2),
+                )
+            )
+
+            opened_snapshot = dict(app_module.last_push_snapshot)
+            opened_risk = dict(app_module.active_trade_state)
+
+            moved_prediction = self.active_prediction(
+                "LONG_ACTIVE",
+                score=82,
+                timestamp=self.iso_at(3),
+            )
+            moved_prediction["entryPrice"] = 2410.0
+            moved_prediction["stopLoss"] = 2405.0
+            moved_prediction["takeProfit"] = 2425.0
+            app_module._notify_signal_change(moved_prediction)
+
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
+        self.assertEqual(app_module.last_push_snapshot["score"], 82.0)
+        self.assertEqual(app_module.last_push_snapshot["timestamp"], self.iso_at(3))
+        self.assertEqual(app_module.last_push_snapshot["signalSnapshotId"], opened_snapshot["signalSnapshotId"])
+        committed_signal = app_module.signal_stabilizer_state[app_module.DEFAULT_SYMBOL]["committed"]
+        self.assertEqual(committed_signal["entryPrice"], opened_risk["entryPrice"])
+        self.assertEqual(committed_signal["stopLoss"], opened_risk["stopLoss"])
+        self.assertEqual(committed_signal["takeProfit"], opened_risk["takeProfit"])
+        self.assertEqual(app_module.active_trade_state["entryPrice"], opened_risk["entryPrice"])
+        self.assertEqual(app_module.active_trade_state["stopLoss"], opened_risk["stopLoss"])
+        self.assertEqual(app_module.active_trade_state["takeProfit"], opened_risk["takeProfit"])
+
     def test_notification_service_worker_route_is_available(self):
         response = self.client.get("/notification-sw.js")
         response_body = response.get_data(as_text=True)

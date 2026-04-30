@@ -112,6 +112,15 @@ MAX_PUSH_KEY_BYTES = 512
 MAX_PUSH_SUBSCRIPTIONS = 200
 NOTIFICATION_DEDUPE_SECONDS = 300
 ACTIVE_ACTION_STATES = {"LONG_ACTIVE", "SHORT_ACTIVE"}
+OPEN_TRADE_IDENTITY_FIELDS = (
+    "entryPrice",
+    "stopLoss",
+    "takeProfit",
+    "slPips",
+    "tpPips",
+    "rrRatio",
+    "createdAt",
+)
 SIGNAL_SNAPSHOT_METADATA_FIELDS = (
     "signal_snapshot_id",
     "calculation_time",
@@ -588,6 +597,9 @@ def _candidate_signal_fields(prediction):
     grace_period_active = validation.get("gracePeriodActive")
     if grace_period_active is None:
         grace_period_active = bool(prediction.get("grace_period_active"))
+    created_at = prediction.get("createdAt")
+    if not created_at and action_state in ACTIVE_ACTION_STATES:
+        created_at = prediction.get("lastUpdate") or prediction.get("timestamp")
 
     fields = {
         "symbol": _prediction_symbol(prediction),
@@ -608,6 +620,7 @@ def _candidate_signal_fields(prediction):
         "slPips": prediction.get("slPips"),
         "tpPips": prediction.get("tpPips"),
         "rrRatio": prediction.get("rrRatio"),
+        "createdAt": created_at,
         "signals": signals,
         "signalsKey": "|".join(_normalize_signal_text(signal) for signal in signals[:4]),
         "timestamp": prediction.get("lastUpdate") or prediction.get("timestamp"),
@@ -647,6 +660,8 @@ def _default_committed_signal(candidate):
         "takeProfit": None,
         "slPips": None,
         "tpPips": None,
+        "rrRatio": None,
+        "createdAt": None,
         "signals": [],
         "signalsKey": "",
     }
@@ -664,6 +679,21 @@ def _same_stabilized_signal(first, second):
         and first.get("verdict") == second.get("verdict")
         and bool(first.get("blockers")) == bool(second.get("blockers"))
     )
+
+
+def _preserve_open_trade_identity(committed, candidate):
+    if (
+        committed.get("actionState") not in ACTIVE_ACTION_STATES
+        or candidate.get("actionState") != committed.get("actionState")
+    ):
+        return candidate
+
+    preserved = dict(candidate)
+    for field in OPEN_TRADE_IDENTITY_FIELDS:
+        value = committed.get(field)
+        if value is not None:
+            preserved[field] = value
+    return preserved
 
 
 def _required_confirmation(committed, candidate):
@@ -740,6 +770,7 @@ def _compose_stabilized_prediction(prediction, committed, candidate, pending, tr
     stabilized["tpPips"] = committed.get("tpPips")
     if committed.get("rrRatio") is not None:
         stabilized["rrRatio"] = committed.get("rrRatio")
+    stabilized["createdAt"] = committed.get("createdAt")
     stabilized["signals"] = list(committed.get("signals") or [])
     stabilized["forecast"]["score"] = committed["score"]
     stabilized["forecast"]["scoreThreshold"] = committed["threshold"]
@@ -923,6 +954,7 @@ def _stabilize_signal_transition(prediction, now=None, advance=True):
                 return _compose_stabilized_prediction(prediction, committed, candidate, pending, False, reason)
 
         if _same_stabilized_signal(committed, candidate):
+            candidate = _preserve_open_trade_identity(committed, candidate)
             committed = candidate
             pending = None
             reason = "same stabilized signal updated"
@@ -1364,6 +1396,23 @@ def _sync_active_trade_state(prediction, now=None):
             if risk_state.get("exitReason") is None:
                 active_trade_state = None
             return None
+
+        if (
+            active_trade_state
+            and active_trade_state.get("status") == "OPEN"
+            and active_trade_state.get("action") == next_active_signal.get("action")
+        ):
+            preserved_active_signal = dict(active_trade_state)
+            preserved_active_signal.update(
+                {
+                    "lastConfirmedScore": next_active_signal.get("lastConfirmedScore"),
+                    "lastConfirmedConfidence": next_active_signal.get("lastConfirmedConfidence"),
+                    "lastConfirmedTradeability": next_active_signal.get("lastConfirmedTradeability"),
+                    "status": "OPEN",
+                }
+            )
+            active_trade_state = preserved_active_signal
+            return dict(active_trade_state)
 
         active_trade_state = next_active_signal
         risk_state = {
