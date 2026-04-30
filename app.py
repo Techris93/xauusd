@@ -103,14 +103,27 @@ ACTIVE_ACTION_STATES = {"LONG_ACTIVE", "SHORT_ACTIVE"}
 SIGNAL_PUSH_PAYLOAD_VERSION = "authoritative-signal-v2"
 SIGNAL_PUSH_MAX_AGE_SECONDS = 300
 MAX_OHLC_RANGE_RATIO = 0.20
+SIGNAL_STABILIZATION_CONFIG = {
+    "activation_score_threshold": float(DEFAULT_PARAMS.get("min_tradeability", 45)),
+    "deactivation_score_threshold": 40,
+    "activation_confirmation_count": 2,
+    "deactivation_confirmation_count": 2,
+    "reversal_confirmation_count": 2,
+    "blocker_confirmation_count": 2,
+    "notification_cooldown_seconds": NOTIFICATION_DEDUPE_SECONDS,
+    "stale_snapshot_seconds": SIGNAL_PUSH_MAX_AGE_SECONDS,
+    "minimum_candle_confirmation_count": 2,
+}
 
 latest_prediction = None
 last_update = None
 error_state = None
 last_push_snapshot = None
 last_notification = {"key": None, "time": None}
+signal_stabilizer_state = {}
 prediction_refresh_lock = threading.RLock()
 push_lock = threading.Lock()
+stabilizer_lock = threading.Lock()
 
 
 def _json_safe(value):
@@ -364,7 +377,7 @@ def _finite_float(value):
 
 
 def _signal_score_threshold():
-    return float(DEFAULT_PARAMS.get("min_tradeability", 45))
+    return float(SIGNAL_STABILIZATION_CONFIG.get("activation_score_threshold", 45))
 
 
 def _format_signal_number(value):
@@ -385,6 +398,59 @@ def _valid_signal_risk(action_state, signal_price, stop_loss, take_profit):
     if action_state == "SHORT_ACTIVE":
         return take_profit < signal_price < stop_loss
     return False
+
+
+def _direction_for_action_state(action_state):
+    if action_state == "LONG_ACTIVE":
+        return "bullish"
+    if action_state == "SHORT_ACTIVE":
+        return "bearish"
+    return "neutral"
+
+
+def _action_for_signal_state(action_state):
+    if action_state == "LONG_ACTIVE":
+        return "buy"
+    if action_state == "SHORT_ACTIVE":
+        return "sell"
+    return "hold"
+
+
+def _verdict_for_signal_state(action_state):
+    if action_state == "LONG_ACTIVE":
+        return "Bullish"
+    if action_state == "SHORT_ACTIVE":
+        return "Bearish"
+    return "Neutral"
+
+
+def _parse_datetime(value):
+    if not value:
+        return None
+    try:
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _prediction_timestamp(prediction):
+    return _parse_datetime(prediction.get("lastUpdate") or prediction.get("timestamp"))
+
+
+def _prediction_candle_timestamp(prediction):
+    chart_data = prediction.get("chartData") if isinstance(prediction.get("chartData"), dict) else {}
+    timestamps = chart_data.get("timestamps") if isinstance(chart_data.get("timestamps"), list) else []
+    return _parse_datetime(timestamps[-1]) if timestamps else None
+
+
+def _prediction_symbol(prediction):
+    return str(prediction.get("symbol") or DEFAULT_SYMBOL or "XAU/USD")
 
 
 def _build_authoritative_signal_state(prediction, status=None):
@@ -471,6 +537,387 @@ def _build_authoritative_signal_state(prediction, status=None):
     }
 
 
+def _candidate_signal_fields(prediction):
+    validation = prediction.get("signalValidation") if isinstance(prediction.get("signalValidation"), dict) else {}
+    signals = prediction.get("signals") if isinstance(prediction.get("signals"), list) else []
+    blockers = validation.get("blockers") if isinstance(validation.get("blockers"), list) else []
+    action_state = validation.get("actionState") or prediction.get("actionState") or "WAIT"
+    score = _finite_float(validation.get("score"))
+    if score is None:
+        score = _prediction_score(prediction)
+    confidence = _finite_float(prediction.get("confidence")) or 50.0
+
+    return {
+        "symbol": _prediction_symbol(prediction),
+        "actionState": action_state,
+        "direction": _direction_for_action_state(action_state),
+        "action": validation.get("action") or prediction.get("action") or _action_for_signal_state(action_state),
+        "verdict": validation.get("verdict") or prediction.get("verdict") or _verdict_for_signal_state(action_state),
+        "tradeabilityLabel": validation.get("tradeabilityLabel") or prediction.get("tradeabilityLabel") or "Low",
+        "confidence": confidence,
+        "score": round(score, 2),
+        "threshold": _finite_float(validation.get("threshold")) or _signal_score_threshold(),
+        "blockers": list(blockers),
+        "activeTrade": bool(validation.get("activeTrade")),
+        "displayStatus": validation.get("displayStatus") or ("Signal Active" if action_state in ACTIVE_ACTION_STATES else "Waiting for Signal"),
+        "entryPrice": prediction.get("entryPrice"),
+        "stopLoss": prediction.get("stopLoss"),
+        "takeProfit": prediction.get("takeProfit"),
+        "slPips": prediction.get("slPips"),
+        "tpPips": prediction.get("tpPips"),
+        "rrRatio": prediction.get("rrRatio"),
+        "signals": signals,
+        "signalsKey": "|".join(_normalize_signal_text(signal) for signal in signals[:4]),
+        "timestamp": prediction.get("lastUpdate") or prediction.get("timestamp"),
+        "snapshotTimestamp": _prediction_timestamp(prediction),
+        "candleTimestamp": _prediction_candle_timestamp(prediction),
+        "dataStatus": validation.get("dataStatus") or prediction.get("status") or "active",
+    }
+
+
+def _default_committed_signal(candidate):
+    if candidate["actionState"] not in ACTIVE_ACTION_STATES:
+        return {
+            **candidate,
+            "activeTrade": False,
+            "displayStatus": candidate.get("displayStatus") or "Waiting for Signal",
+        }
+
+    return {
+        **candidate,
+        "actionState": "WAIT",
+        "direction": "neutral",
+        "action": "hold",
+        "verdict": "Neutral",
+        "tradeabilityLabel": "Low",
+        "confidence": 50.0,
+        "score": 0.0,
+        "blockers": [],
+        "activeTrade": False,
+        "displayStatus": "Waiting for Signal",
+        "entryPrice": None,
+        "stopLoss": None,
+        "takeProfit": None,
+        "slPips": None,
+        "tpPips": None,
+        "signals": [],
+        "signalsKey": "",
+    }
+
+
+def _transition_identity(fields):
+    if fields["actionState"] in ACTIVE_ACTION_STATES:
+        return fields["actionState"]
+    return "WAIT_BLOCKED" if fields.get("blockers") else "WAIT"
+
+
+def _same_stabilized_signal(first, second):
+    return (
+        first.get("actionState") == second.get("actionState")
+        and first.get("verdict") == second.get("verdict")
+        and bool(first.get("blockers")) == bool(second.get("blockers"))
+    )
+
+
+def _required_confirmation(committed, candidate):
+    config = SIGNAL_STABILIZATION_CONFIG
+    committed_active = committed["actionState"] in ACTIVE_ACTION_STATES
+    candidate_active = candidate["actionState"] in ACTIVE_ACTION_STATES
+
+    if candidate_active and committed_active and candidate["actionState"] != committed["actionState"]:
+        return config["reversal_confirmation_count"], "reversal"
+    if candidate_active and not committed_active:
+        return config["activation_confirmation_count"], "activation"
+    if not candidate_active and committed_active:
+        return config["deactivation_confirmation_count"], "deactivation"
+    if not candidate_active and bool(candidate.get("blockers")) != bool(committed.get("blockers")):
+        return config["blocker_confirmation_count"], "blocker"
+    return 1, "update"
+
+
+def _update_pending_signal_state(state, candidate, transition_type):
+    key = "|".join(
+        [
+            transition_type,
+            _transition_identity(candidate),
+            candidate["direction"],
+            "blocked" if candidate.get("blockers") else "clear",
+        ]
+    )
+    pending = state.get("pending")
+    candle_timestamp = candidate.get("candleTimestamp")
+
+    if pending and pending.get("key") == key:
+        pending["confirmationCount"] += 1
+        if candle_timestamp and candle_timestamp != pending.get("lastCandleTimestamp"):
+            pending["candleConfirmationCount"] += 1
+            pending["lastCandleTimestamp"] = candle_timestamp
+        pending["candidate"] = candidate
+    else:
+        pending = {
+            "key": key,
+            "candidate": candidate,
+            "transitionType": transition_type,
+            "confirmationCount": 1,
+            "candleConfirmationCount": 1 if candle_timestamp else 0,
+            "lastCandleTimestamp": candle_timestamp,
+        }
+        state["pending"] = pending
+
+    return pending
+
+
+def _snapshot_is_stale(candidate, now):
+    snapshot_timestamp = candidate.get("snapshotTimestamp")
+    if snapshot_timestamp is None:
+        return False
+    max_age = timedelta(seconds=SIGNAL_STABILIZATION_CONFIG["stale_snapshot_seconds"])
+    return now - snapshot_timestamp > max_age
+
+
+def _compose_stabilized_prediction(prediction, committed, candidate, pending, transition_allowed, reason):
+    stabilized = dict(prediction)
+    forecast = stabilized.get("forecast") if isinstance(stabilized.get("forecast"), dict) else {}
+    stabilized["forecast"] = dict(forecast)
+
+    stabilized["verdict"] = committed["verdict"]
+    stabilized["action"] = committed["action"]
+    stabilized["actionState"] = committed["actionState"]
+    stabilized["tradeabilityLabel"] = committed["tradeabilityLabel"]
+    stabilized["confidence"] = round(committed["confidence"])
+    stabilized["blockers"] = list(committed.get("blockers") or [])
+    stabilized["entryPrice"] = committed.get("entryPrice")
+    stabilized["stopLoss"] = committed.get("stopLoss")
+    stabilized["takeProfit"] = committed.get("takeProfit")
+    stabilized["slPips"] = committed.get("slPips")
+    stabilized["tpPips"] = committed.get("tpPips")
+    if committed.get("rrRatio") is not None:
+        stabilized["rrRatio"] = committed.get("rrRatio")
+    stabilized["signals"] = list(committed.get("signals") or [])
+    stabilized["forecast"]["score"] = committed["score"]
+    stabilized["forecast"]["scoreThreshold"] = committed["threshold"]
+    stabilized["forecast"]["rawCandidateScore"] = candidate["score"]
+    stabilized["signalScoreThreshold"] = committed["threshold"]
+
+    pending_candidate = pending.get("candidate") if pending else None
+    pending_state = pending_candidate.get("actionState") if pending_candidate else None
+    pending_direction = pending_candidate.get("direction") if pending_candidate else None
+    confirmation_count = pending.get("confirmationCount", 0) if pending else 0
+    candle_confirmation_count = pending.get("candleConfirmationCount", 0) if pending else 0
+    blocker_confirmation_count = confirmation_count if pending_state == "WAIT" and pending_candidate and pending_candidate.get("blockers") else 0
+
+    stabilized["signalValidation"] = {
+        "stabilized": True,
+        "rawActionState": candidate["actionState"],
+        "rawAction": candidate["action"],
+        "rawVerdict": candidate["verdict"],
+        "actionState": committed["actionState"],
+        "action": committed["action"],
+        "verdict": committed["verdict"],
+        "tradeabilityLabel": committed["tradeabilityLabel"],
+        "score": committed["score"],
+        "threshold": committed["threshold"],
+        "blockers": list(committed.get("blockers") or []),
+        "activeTrade": committed["actionState"] in ACTIVE_ACTION_STATES,
+        "displayStatus": committed.get("displayStatus") or "Waiting for Signal",
+        "signalPrice": committed.get("entryPrice"),
+        "stopLoss": committed.get("stopLoss"),
+        "takeProfit": committed.get("takeProfit"),
+        "suppressionReasons": [] if transition_allowed else [reason],
+        "dataStatus": candidate.get("dataStatus"),
+        "candidateState": candidate["actionState"],
+        "candidateSignal": candidate["actionState"],
+        "candidateDirection": candidate["direction"],
+        "candidateBias": candidate["verdict"],
+        "candidateScore": candidate["score"],
+        "candidateConfidence": candidate["confidence"],
+        "candidateBlockers": list(candidate.get("blockers") or []),
+        "committedState": committed["actionState"],
+        "committedSignal": committed["actionState"],
+        "committedDirection": committed["direction"],
+        "committedBias": committed["verdict"],
+        "committedScore": committed["score"],
+        "committedConfidence": committed["confidence"],
+        "pendingState": pending_state,
+        "pendingDirection": pending_direction,
+        "confirmationCount": confirmation_count,
+        "candleConfirmationCount": candle_confirmation_count,
+        "blockerConfirmationCount": blocker_confirmation_count,
+        "transitionAllowed": transition_allowed,
+        "notificationAllowed": transition_allowed,
+        "suppressionOrWaitReason": reason,
+        "snapshotTimestamp": candidate.get("timestamp"),
+        "candleTimestamp": candidate.get("candleTimestamp").isoformat() if candidate.get("candleTimestamp") else None,
+    }
+    return stabilized
+
+
+def _log_stabilization_decision(symbol, previous_committed, candidate, pending, transition_allowed, reason, next_committed=None):
+    next_committed = next_committed or (candidate if transition_allowed else previous_committed)
+    logger.info(
+        "Signal stabilization symbol=%s raw_candidate=%s previous_committed=%s next_committed=%s pending=%s "
+        "candidate_direction=%s previous_direction=%s next_direction=%s confirmation_count=%s "
+        "candidate_bias=%s previous_bias=%s next_bias=%s candidate_score=%.2f previous_score=%.2f next_score=%.2f "
+        "candidate_confidence=%.1f previous_confidence=%.1f next_confidence=%.1f blockers=%s "
+        "blocker_confirmation_count=%s transition_allowed=%s notification_allowed=%s "
+        "suppression_reason=%s snapshot_timestamp=%s candle_timestamp=%s",
+        symbol,
+        candidate["actionState"],
+        previous_committed["actionState"],
+        next_committed["actionState"],
+        pending.get("candidate", {}).get("actionState") if pending else None,
+        candidate["direction"],
+        previous_committed["direction"],
+        next_committed["direction"],
+        pending.get("confirmationCount", 0) if pending else 0,
+        candidate["verdict"],
+        previous_committed["verdict"],
+        next_committed["verdict"],
+        candidate["score"],
+        previous_committed["score"],
+        next_committed["score"],
+        candidate["confidence"],
+        previous_committed["confidence"],
+        next_committed["confidence"],
+        candidate.get("blockers", []),
+        pending.get("confirmationCount", 0) if pending and pending.get("candidate", {}).get("blockers") else 0,
+        transition_allowed,
+        transition_allowed,
+        reason,
+        candidate.get("timestamp"),
+        candidate.get("candleTimestamp").isoformat() if candidate.get("candleTimestamp") else None,
+    )
+
+
+def _stabilize_signal_transition(prediction, now=None, advance=True):
+    now = now or datetime.now(timezone.utc)
+    candidate = _candidate_signal_fields(prediction)
+    symbol = candidate["symbol"]
+
+    with stabilizer_lock:
+        state = signal_stabilizer_state.setdefault(symbol, {})
+        committed = state.get("committed") or _default_committed_signal(candidate)
+        previous_committed = committed
+
+        snapshot_timestamp = candidate.get("snapshotTimestamp")
+        last_snapshot_timestamp = state.get("lastSnapshotTimestamp")
+        if candidate.get("dataStatus") != "active":
+            reason = f"data status {candidate.get('dataStatus')} blocks active signal"
+            if advance:
+                state["pending"] = None
+                if committed["actionState"] not in ACTIVE_ACTION_STATES:
+                    state["committed"] = candidate
+                state["lastSnapshotTimestamp"] = snapshot_timestamp or now
+            _log_stabilization_decision(
+                symbol,
+                committed,
+                candidate,
+                None,
+                False,
+                reason,
+                next_committed=candidate,
+            )
+            return _compose_stabilized_prediction(prediction, candidate, candidate, None, False, reason)
+
+        if snapshot_timestamp and last_snapshot_timestamp and snapshot_timestamp <= last_snapshot_timestamp:
+            reason = "duplicate or out-of-order snapshot ignored"
+            pending = state.get("pending")
+            _log_stabilization_decision(symbol, committed, candidate, pending, False, reason)
+            return _compose_stabilized_prediction(prediction, committed, candidate, pending, False, reason)
+
+        if _snapshot_is_stale(candidate, now):
+            reason = "stale snapshot ignored"
+            pending = state.get("pending")
+            _log_stabilization_decision(symbol, committed, candidate, pending, False, reason)
+            return _compose_stabilized_prediction(prediction, committed, candidate, pending, False, reason)
+
+        if committed["actionState"] in ACTIVE_ACTION_STATES and candidate["actionState"] == "WAIT":
+            if (
+                candidate["score"] >= SIGNAL_STABILIZATION_CONFIG["deactivation_score_threshold"]
+                and not candidate.get("blockers")
+            ):
+                reason = "holding active signal inside score hysteresis band"
+                pending = state.get("pending")
+                if advance:
+                    state["lastSnapshotTimestamp"] = snapshot_timestamp or now
+                _log_stabilization_decision(symbol, committed, candidate, pending, False, reason)
+                return _compose_stabilized_prediction(prediction, committed, candidate, pending, False, reason)
+
+        if _same_stabilized_signal(committed, candidate):
+            committed = candidate
+            pending = None
+            reason = "same stabilized signal updated"
+            if advance:
+                state["committed"] = committed
+                state["pending"] = None
+                state["lastSnapshotTimestamp"] = snapshot_timestamp or now
+            _log_stabilization_decision(
+                symbol,
+                previous_committed,
+                candidate,
+                pending,
+                True,
+                reason,
+                next_committed=committed,
+            )
+            return _compose_stabilized_prediction(prediction, committed, candidate, pending, True, reason)
+
+        required_count, transition_type = _required_confirmation(committed, candidate)
+        pending = _update_pending_signal_state(state, candidate, transition_type) if advance else {
+            "candidate": candidate,
+            "transitionType": transition_type,
+            "confirmationCount": 1,
+            "candleConfirmationCount": 1 if candidate.get("candleTimestamp") else 0,
+        }
+        confirmation_count = pending.get("confirmationCount", 0)
+        candle_count = pending.get("candleConfirmationCount", 0)
+        candle_confirmed = bool(
+            candidate.get("candleTimestamp")
+            and candle_count >= SIGNAL_STABILIZATION_CONFIG["minimum_candle_confirmation_count"]
+        )
+        transition_allowed = (
+            confirmation_count >= required_count
+            or candle_confirmed
+        )
+
+        if transition_allowed:
+            committed = candidate
+            reason = f"{transition_type} confirmed"
+            if advance:
+                state["committed"] = committed
+                state["pending"] = None
+        else:
+            reason = f"waiting for {transition_type} confirmation {confirmation_count}/{required_count}"
+
+        if advance:
+            state["lastSnapshotTimestamp"] = snapshot_timestamp or now
+
+        _log_stabilization_decision(
+            symbol,
+            previous_committed,
+            candidate,
+            pending,
+            transition_allowed,
+            reason,
+            next_committed=committed,
+        )
+        return _compose_stabilized_prediction(prediction, committed, candidate, pending, transition_allowed, reason)
+
+
+def _is_stabilized_prediction(prediction):
+    validation = prediction.get("signalValidation") if isinstance(prediction, dict) else None
+    return isinstance(validation, dict) and validation.get("stabilized") is True
+
+
+def _ensure_stabilized_signal_prediction(prediction, status=None, now=None, advance=False):
+    if not isinstance(prediction, dict) or prediction.get("error"):
+        return prediction
+    if _is_stabilized_prediction(prediction) and status is None:
+        return prediction
+    validated = _apply_authoritative_signal_state(prediction, status=status)
+    return _stabilize_signal_transition(validated, now=now, advance=advance)
+
+
 def _apply_authoritative_signal_state(prediction, status=None):
     if not isinstance(prediction, dict) or prediction.get("error"):
         return prediction
@@ -503,7 +950,7 @@ def _build_server_signal_snapshot(prediction):
     if not isinstance(prediction, dict) or prediction.get("error"):
         return None
 
-    normalized = _apply_authoritative_signal_state(prediction)
+    normalized = _ensure_stabilized_signal_prediction(prediction, advance=False)
     validation = normalized.get("signalValidation") or {}
     signals = normalized.get("signals") if isinstance(normalized.get("signals"), list) else []
     blockers = validation.get("blockers") if isinstance(validation.get("blockers"), list) else []
@@ -524,6 +971,7 @@ def _build_server_signal_snapshot(prediction):
         "hasBlockers": bool(blockers),
         "blockers": blockers,
         "isActionable": bool(validation.get("activeTrade")),
+        "notificationAllowed": bool(validation.get("notificationAllowed", True)),
         "suppressionReasons": list(validation.get("suppressionReasons") or []),
         "displayStatus": validation.get("displayStatus") or "Waiting for Signal",
         "dataStatus": validation.get("dataStatus") or "active",
@@ -554,6 +1002,9 @@ def _is_actionable_signal_snapshot(snapshot):
 
 
 def _is_pushworthy_signal_change(previous_snapshot, current_snapshot):
+    if not current_snapshot.get("notificationAllowed", True):
+        return False
+
     previous_actionable = _is_actionable_signal_snapshot(previous_snapshot)
     current_actionable = _is_actionable_signal_snapshot(current_snapshot)
 
@@ -663,7 +1114,7 @@ def _should_send_signal_notification(current_snapshot, now=None):
     if (
         key == last_key
         and last_time is not None
-        and (now - last_time).total_seconds() < NOTIFICATION_DEDUPE_SECONDS
+        and (now - last_time).total_seconds() < SIGNAL_STABILIZATION_CONFIG["notification_cooldown_seconds"]
     ):
         logger.info("Skipping duplicate push alert for %s inside dedupe window.", key)
         return False
@@ -749,7 +1200,8 @@ def _send_web_push_notification(title, body, severity):
 def _remember_signal_snapshot(prediction):
     global last_push_snapshot
 
-    current_snapshot = _build_server_signal_snapshot(prediction)
+    stabilized_prediction = _ensure_stabilized_signal_prediction(prediction, advance=True)
+    current_snapshot = _build_server_signal_snapshot(stabilized_prediction)
     if current_snapshot is None:
         return None
     last_push_snapshot = current_snapshot
@@ -759,7 +1211,8 @@ def _remember_signal_snapshot(prediction):
 def _notify_signal_change(prediction):
     global last_push_snapshot
 
-    current_snapshot = _build_server_signal_snapshot(prediction)
+    stabilized_prediction = _ensure_stabilized_signal_prediction(prediction, advance=True)
+    current_snapshot = _build_server_signal_snapshot(stabilized_prediction)
     if current_snapshot is None:
         return
 
@@ -1069,7 +1522,11 @@ def generate_prediction(notify=True):
                 "timestamps": [timestamp.isoformat() for timestamp in recent_frame.index],
             }
 
-            prediction = _apply_authoritative_signal_state(prediction, status="active")
+            prediction = _ensure_stabilized_signal_prediction(
+                prediction,
+                status="active",
+                advance=True,
+            )
             latest_prediction = _json_safe(prediction)
             last_update = datetime.now(timezone.utc)
             error_state = None
@@ -1195,7 +1652,7 @@ def api_prediction():
         "error": error_state if not has_usable_prediction else None,
         "warning": error_state if has_usable_prediction and error_state else None,
     }
-    response = _apply_authoritative_signal_state(response, status=status)
+    response = _ensure_stabilized_signal_prediction(response, status=status, advance=False)
 
     return jsonify(_json_safe(response))
 

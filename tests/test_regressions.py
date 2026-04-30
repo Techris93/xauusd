@@ -36,6 +36,7 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.error_state = None
         app_module.last_push_snapshot = None
         app_module.last_notification = {"key": None, "time": None}
+        app_module.signal_stabilizer_state = {}
         app_module.get_web_push_config.cache_clear()
         signal_state.reset()
         self.client = app_module.app.test_client()
@@ -46,6 +47,7 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.error_state = None
         app_module.last_push_snapshot = None
         app_module.last_notification = {"key": None, "time": None}
+        app_module.signal_stabilizer_state = {}
         app_module.get_web_push_config.cache_clear()
         signal_state.reset()
 
@@ -129,9 +131,11 @@ class PredictorRegressionTests(unittest.TestCase):
         }
 
     @staticmethod
-    def active_prediction(action_state="SHORT_ACTIVE", score=60, blockers=None):
+    def active_prediction(action_state="SHORT_ACTIVE", score=60, blockers=None, timestamp=None, candle_timestamp=None):
         is_long = action_state == "LONG_ACTIVE"
         entry_price = 2400.0
+        timestamp = timestamp or datetime.now(timezone.utc).isoformat()
+        candle_timestamp = candle_timestamp or timestamp
         return {
             "verdict": "Bullish" if is_long else "Bearish",
             "confidence": 82,
@@ -144,7 +148,29 @@ class PredictorRegressionTests(unittest.TestCase):
             "entryPrice": entry_price,
             "stopLoss": entry_price - 3.0 if is_long else entry_price + 3.0,
             "takeProfit": entry_price + 6.0 if is_long else entry_price - 6.0,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": timestamp,
+            "lastUpdate": timestamp,
+            "chartData": {"timestamps": [candle_timestamp]},
+        }
+
+    @staticmethod
+    def wait_prediction(score=35, blockers=None, timestamp=None, candle_timestamp=None):
+        timestamp = timestamp or datetime.now(timezone.utc).isoformat()
+        candle_timestamp = candle_timestamp or timestamp
+        if blockers is None:
+            blockers = [f"signal score {score} below threshold 45"]
+        return {
+            "verdict": "Neutral",
+            "confidence": 70,
+            "action": "hold",
+            "actionState": "WAIT",
+            "tradeabilityLabel": "Low",
+            "blockers": list(blockers),
+            "signals": ["VWAP rejection faded"],
+            "forecast": {"score": score},
+            "timestamp": timestamp,
+            "lastUpdate": timestamp,
+            "chartData": {"timestamps": [candle_timestamp]},
         }
 
     @staticmethod
@@ -172,6 +198,13 @@ class PredictorRegressionTests(unittest.TestCase):
         }
         payload.update(overrides)
         return pd.DataFrame(payload, index=index)
+
+    @staticmethod
+    def iso_at(offset_seconds):
+        return (
+            datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+            + timedelta(seconds=offset_seconds)
+        ).isoformat()
 
     def test_prepare_data_assigns_nearest_levels_without_existing_columns(self):
         prepared = prepare_data(self.build_frame())
@@ -756,10 +789,12 @@ class PredictorRegressionTests(unittest.TestCase):
 
     def test_active_push_requires_unblocked_actionable_prediction(self):
         app_module.last_push_snapshot = self.wait_snapshot(score=80.0)
-        active_prediction = self.active_prediction("SHORT_ACTIVE", score=90)
+        first_prediction = self.active_prediction("SHORT_ACTIVE", score=90, timestamp=self.iso_at(1))
+        second_prediction = self.active_prediction("SHORT_ACTIVE", score=90, timestamp=self.iso_at(2))
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
-            app_module._notify_signal_change(active_prediction)
+            app_module._notify_signal_change(first_prediction)
+            app_module._notify_signal_change(second_prediction)
 
         mocked_push.assert_called_once()
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD short signal active")
@@ -820,20 +855,24 @@ class PredictorRegressionTests(unittest.TestCase):
 
     def test_valid_short_active_push_requires_score_blockers_signal_price_and_risk(self):
         app_module.last_push_snapshot = self.wait_snapshot()
-        active_prediction = self.active_prediction("SHORT_ACTIVE", score=60)
+        first_prediction = self.active_prediction("SHORT_ACTIVE", score=60, timestamp=self.iso_at(1))
+        second_prediction = self.active_prediction("SHORT_ACTIVE", score=60, timestamp=self.iso_at(2))
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
-            app_module._notify_signal_change(active_prediction)
+            app_module._notify_signal_change(first_prediction)
+            app_module._notify_signal_change(second_prediction)
 
         mocked_push.assert_called_once()
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD short signal active")
 
     def test_valid_long_active_push_requires_score_blockers_signal_price_and_risk(self):
         app_module.last_push_snapshot = self.wait_snapshot()
-        active_prediction = self.active_prediction("LONG_ACTIVE", score=60)
+        first_prediction = self.active_prediction("LONG_ACTIVE", score=60, timestamp=self.iso_at(1))
+        second_prediction = self.active_prediction("LONG_ACTIVE", score=60, timestamp=self.iso_at(2))
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
-            app_module._notify_signal_change(active_prediction)
+            app_module._notify_signal_change(first_prediction)
+            app_module._notify_signal_change(second_prediction)
 
         mocked_push.assert_called_once()
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD long signal active")
@@ -863,6 +902,32 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(app_module.last_push_snapshot["verdict"], "Neutral")
         self.assertIn("app status is stale", app_module.last_push_snapshot["blockers"])
 
+    def test_stale_status_blocks_committed_active_dashboard_without_pause_spam(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(2)))
+            self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
+            mocked_push.reset_mock()
+
+            stale_prediction = self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(3))
+            stale_prediction["status"] = "stale"
+            dashboard_prediction = app_module._ensure_stabilized_signal_prediction(
+                stale_prediction,
+                status="stale",
+                advance=False,
+            )
+            app_module._notify_signal_change(stale_prediction)
+
+        self.assertEqual(dashboard_prediction["actionState"], "WAIT")
+        self.assertEqual(dashboard_prediction["verdict"], "Neutral")
+        self.assertIn("app status is stale", dashboard_prediction["blockers"])
+        self.assertFalse(dashboard_prediction["signalValidation"]["notificationAllowed"])
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertFalse(app_module.last_push_snapshot["notificationAllowed"])
+
     def test_low_tradeability_suppresses_active_alert(self):
         app_module.last_push_snapshot = self.wait_snapshot()
         active_prediction = self.active_prediction("LONG_ACTIVE", score=90)
@@ -885,6 +950,169 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(dashboard_prediction["signalValidation"]["score"], 25.0)
         self.assertEqual(notification_snapshot["score"], 25.0)
         self.assertIn("signal score 25 below threshold 45", dashboard_prediction["blockers"])
+
+    def test_unstable_wait_long_wait_long_does_not_commit_or_spam(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.wait_prediction(score=40, timestamp=self.iso_at(2)))
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(3)))
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+
+    def test_unstable_wait_short_wait_short_does_not_commit_or_spam(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.wait_prediction(score=40, timestamp=self.iso_at(2)))
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(3)))
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+
+    def test_stable_long_activation_commits_once(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(2)))
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=74, timestamp=self.iso_at(3)))
+
+        self.assertEqual(mocked_push.call_count, 1)
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD long signal active")
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
+
+    def test_stable_short_activation_commits_once(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(2)))
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=74, timestamp=self.iso_at(3)))
+
+        self.assertEqual(mocked_push.call_count, 1)
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD short signal active")
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
+
+    def test_stable_long_pause_commits_once(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(2)))
+            mocked_push.reset_mock()
+            app_module._notify_signal_change(self.wait_prediction(score=35, timestamp=self.iso_at(3)))
+            app_module._notify_signal_change(self.wait_prediction(score=35, timestamp=self.iso_at(4)))
+
+        self.assertEqual(mocked_push.call_count, 1)
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD signal paused")
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+
+    def test_stable_short_pause_commits_once(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(2)))
+            mocked_push.reset_mock()
+            app_module._notify_signal_change(self.wait_prediction(score=35, timestamp=self.iso_at(3)))
+            app_module._notify_signal_change(self.wait_prediction(score=35, timestamp=self.iso_at(4)))
+
+        self.assertEqual(mocked_push.call_count, 1)
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD signal paused")
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+
+    def test_long_to_short_reversal_requires_confirmation(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(2)))
+            mocked_push.reset_mock()
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=74, timestamp=self.iso_at(3)))
+            self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=74, timestamp=self.iso_at(4)))
+
+        self.assertEqual(mocked_push.call_count, 1)
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD short signal active")
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
+
+    def test_short_to_long_reversal_requires_confirmation(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(2)))
+            mocked_push.reset_mock()
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=74, timestamp=self.iso_at(3)))
+            self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=74, timestamp=self.iso_at(4)))
+
+        self.assertEqual(mocked_push.call_count, 1)
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD long signal active")
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
+
+    def test_score_hysteresis_prevents_threshold_chatter(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=46, timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=46, timestamp=self.iso_at(2)))
+            mocked_push.reset_mock()
+            app_module._notify_signal_change(self.wait_prediction(score=44, blockers=[], timestamp=self.iso_at(3)))
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=46, timestamp=self.iso_at(4)))
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
+
+    def test_single_snapshot_blocker_does_not_pause_active_trade(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(2)))
+            mocked_push.reset_mock()
+            app_module._notify_signal_change(self.wait_prediction(score=35, blockers=["temporary blocker"], timestamp=self.iso_at(3)))
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
+
+    def test_blockers_cleared_requires_confirmation_window(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.wait_prediction(score=35, blockers=["confirmed blocker"], timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.wait_prediction(score=35, blockers=["confirmed blocker"], timestamp=self.iso_at(2)))
+            mocked_push.reset_mock()
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(3)))
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertTrue(app_module.last_push_snapshot["hasBlockers"])
+
+    def test_duplicate_snapshot_is_ignored_for_confirmation(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+        timestamp = self.iso_at(1)
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=timestamp))
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=timestamp))
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+
+    def test_stale_snapshot_is_ignored_for_confirmation(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+        stale_timestamp = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=stale_timestamp))
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
 
     def test_web_push_config_derives_public_key_when_env_key_is_mismatched(self):
         private_key = app_module.ec.generate_private_key(app_module.ec.SECP256R1())
