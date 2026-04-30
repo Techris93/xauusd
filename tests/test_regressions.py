@@ -22,6 +22,7 @@ import signal_engine as signal_module
 from signal_engine import (
     calculate_anticipatory_score,
     calculate_confidence,
+    calculate_stop_loss_take_profit,
     detect_structure_break,
     prepare_data,
     signal_state,
@@ -146,6 +147,13 @@ class PredictorRegressionTests(unittest.TestCase):
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
+    @staticmethod
+    def risk_frame(atr_value=None):
+        payload = {"Close": [4577.0]}
+        if atr_value is not None:
+            payload["ATR_14"] = [atr_value]
+        return pd.DataFrame(payload)
+
     def test_prepare_data_assigns_nearest_levels_without_existing_columns(self):
         prepared = prepare_data(self.build_frame())
 
@@ -184,6 +192,109 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIn("Volume", prepared.columns)
         self.assertTrue((prepared["Volume"] == 0.0).all())
         self.assertFalse(prepared["VWAP"].tail(10).isna().any())
+
+    def test_stop_loss_take_profit_uses_fallback_for_corrupted_high_atr(self):
+        sl, tp, sl_pips, tp_pips = calculate_stop_loss_take_profit(
+            4577.0,
+            "Bullish",
+            self.risk_frame(207.0),
+            app_module.DEFAULT_PARAMS,
+        )
+
+        self.assertAlmostEqual(sl, 4542.67, places=2)
+        self.assertAlmostEqual(tp, 4645.65, places=2)
+        self.assertAlmostEqual(sl_pips, 343.3, places=1)
+        self.assertAlmostEqual(tp_pips, 686.5, places=1)
+        self.assertNotAlmostEqual(sl, 4266.5, places=1)
+        self.assertNotAlmostEqual(tp, 5198.0, places=1)
+
+    def test_stop_loss_take_profit_uses_fallback_for_missing_atr(self):
+        sl, tp, sl_pips, tp_pips = calculate_stop_loss_take_profit(
+            4577.0,
+            "Bullish",
+            self.risk_frame(),
+            app_module.DEFAULT_PARAMS,
+        )
+
+        self.assertAlmostEqual(sl, 4542.67, places=2)
+        self.assertAlmostEqual(tp, 4645.65, places=2)
+        self.assertAlmostEqual(sl_pips, 343.3, places=1)
+        self.assertAlmostEqual(tp_pips, 686.5, places=1)
+
+    def test_stop_loss_take_profit_uses_fallback_for_nan_atr(self):
+        sl, tp, sl_pips, tp_pips = calculate_stop_loss_take_profit(
+            4577.0,
+            "Bullish",
+            self.risk_frame(float("nan")),
+            app_module.DEFAULT_PARAMS,
+        )
+
+        self.assertAlmostEqual(sl, 4542.67, places=2)
+        self.assertAlmostEqual(tp, 4645.65, places=2)
+        self.assertAlmostEqual(sl_pips, 343.3, places=1)
+        self.assertAlmostEqual(tp_pips, 686.5, places=1)
+
+    def test_stop_loss_take_profit_uses_fallback_for_low_invalid_atr(self):
+        sl, tp, sl_pips, tp_pips = calculate_stop_loss_take_profit(
+            4577.0,
+            "Bullish",
+            self.risk_frame(0.2),
+            app_module.DEFAULT_PARAMS,
+        )
+
+        self.assertAlmostEqual(sl, 4542.67, places=2)
+        self.assertAlmostEqual(tp, 4645.65, places=2)
+        self.assertAlmostEqual(sl_pips, 343.3, places=1)
+        self.assertAlmostEqual(tp_pips, 686.5, places=1)
+
+    def test_stop_loss_take_profit_uses_valid_atr_for_long_and_short(self):
+        long_sl, long_tp, long_sl_pips, long_tp_pips = calculate_stop_loss_take_profit(
+            4577.0,
+            "Bullish",
+            self.risk_frame(10.0),
+            app_module.DEFAULT_PARAMS,
+        )
+        short_sl, short_tp, short_sl_pips, short_tp_pips = calculate_stop_loss_take_profit(
+            4577.0,
+            "Bearish",
+            self.risk_frame(10.0),
+            app_module.DEFAULT_PARAMS,
+        )
+
+        self.assertEqual(long_sl, 4562.0)
+        self.assertEqual(long_tp, 4607.0)
+        self.assertEqual(long_sl_pips, 150.0)
+        self.assertEqual(long_tp_pips, 300.0)
+        self.assertEqual(short_sl, 4592.0)
+        self.assertEqual(short_tp, 4547.0)
+        self.assertEqual(short_sl_pips, 150.0)
+        self.assertEqual(short_tp_pips, 300.0)
+
+    def test_stop_loss_take_profit_caps_extreme_distances(self):
+        sl, tp, sl_pips, tp_pips = calculate_stop_loss_take_profit(
+            1000.0,
+            "Bullish",
+            self.risk_frame(49.0),
+            app_module.DEFAULT_PARAMS,
+        )
+
+        self.assertEqual(sl, 980.0)
+        self.assertEqual(tp, 1050.0)
+        self.assertLessEqual(abs(1000.0 - sl), 20.0)
+        self.assertLessEqual(abs(tp - 1000.0), 50.0)
+        self.assertEqual(sl_pips, 200.0)
+        self.assertEqual(tp_pips, 500.0)
+
+    def test_stop_loss_take_profit_pips_match_backend_distance(self):
+        sl, tp, sl_pips, tp_pips = calculate_stop_loss_take_profit(
+            4577.0,
+            "Bullish",
+            self.risk_frame(207.0),
+            app_module.DEFAULT_PARAMS,
+        )
+
+        self.assertAlmostEqual((4577.0 - sl) / 0.10, sl_pips, places=1)
+        self.assertAlmostEqual((tp - 4577.0) / 0.10, tp_pips, places=1)
 
     def test_detect_structure_break_uses_prior_range_without_current_candle(self):
         rows = []

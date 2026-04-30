@@ -4,11 +4,15 @@ Fixed Signal Engine for Gold Predictor
 Addresses: Over-filtering, lagging confirmation, session blocking, 
 structure break anticipation, and deadlock issues.
 """
+import logging
 import math
 import numpy as np
 import pandas as pd
 import ta
 from datetime import datetime, timedelta, timezone
+
+
+logger = logging.getLogger(__name__)
 
 # ============================================
 # CORE FIX 1: STREAMLINED PARAMETERS
@@ -43,6 +47,13 @@ DEFAULT_PARAMS = {
     "trail_adx_threshold": 35,     # For trailing stops
     "sl_atr_mult": 1.5,
     "tp_atr_mult": 3.0,
+    "symbol": "XAU/USD",
+    "xauusd_min_atr": 1.0,
+    "xauusd_max_atr": 50.0,
+    "fallback_atr_percent": 0.005,
+    "max_sl_percent": 0.02,
+    "max_tp_percent": 0.05,
+    "pip_size": 0.10,
 }
 
 
@@ -607,14 +618,46 @@ def determine_action(score, direction, confidence, verdict, tradeability, blocke
 
 def calculate_stop_loss_take_profit(current_price, direction, df, params):
     """
-    ATR-based SL/TP with proper risk:reward.
+    ATR-based SL/TP with guardrails for corrupted XAU/USD candle gaps.
     """
-    atr = df['ATR_14'].iloc[-1] if 'ATR_14' in df else current_price * 0.002
-    if pd.isna(atr) or atr <= 0:
-        atr = current_price * 0.002
+    raw_atr = df['ATR_14'].iloc[-1] if 'ATR_14' in df and not df.empty else None
+    validated_atr = None
+    if raw_atr is not None:
+        try:
+            raw_atr_number = float(raw_atr)
+        except (TypeError, ValueError):
+            raw_atr_number = None
+        if raw_atr_number is not None and math.isfinite(raw_atr_number):
+            validated_atr = raw_atr_number
 
-    sl_distance = atr * params['sl_atr_mult']
-    tp_distance = atr * params['tp_atr_mult']
+    symbol = str(params.get("symbol", "XAU/USD")).upper()
+    if validated_atr is not None:
+        if validated_atr <= 0:
+            validated_atr = None
+        elif "XAU" in symbol and (
+            validated_atr < params.get("xauusd_min_atr", 1.0)
+            or validated_atr > params.get("xauusd_max_atr", 50.0)
+        ):
+            validated_atr = None
+
+    fallback_used = validated_atr is None
+    atr = (
+        current_price * params.get("fallback_atr_percent", 0.005)
+        if fallback_used
+        else validated_atr
+    )
+
+    pip_size = params.get("pip_size", 0.10)
+    if not isinstance(pip_size, (int, float)) or not math.isfinite(pip_size) or pip_size <= 0:
+        pip_size = 0.10
+    sl_distance = min(
+        atr * params['sl_atr_mult'],
+        current_price * params.get("max_sl_percent", 0.02),
+    )
+    tp_distance = min(
+        atr * params['tp_atr_mult'],
+        current_price * params.get("max_tp_percent", 0.05),
+    )
 
     if direction == "Bullish":
         sl = current_price - sl_distance
@@ -623,7 +666,27 @@ def calculate_stop_loss_take_profit(current_price, direction, df, params):
         sl = current_price + sl_distance
         tp = current_price - tp_distance
 
-    return round(sl, 2), round(tp, 2), round(sl_distance / 0.1, 1), round(tp_distance / 0.1, 1)
+    sl_pips = round(abs(sl_distance) / pip_size, 1)
+    tp_pips = round(abs(tp_distance) / pip_size, 1)
+
+    logger.info(
+        "SL/TP calculated current_price=%.2f direction=%s raw_atr=%s validated_atr=%s "
+        "fallback_atr_used=%s sl_distance=%.2f tp_distance=%.2f stop_loss=%.2f "
+        "take_profit=%.2f pip_size=%.2f target_pips=%.1f",
+        current_price,
+        direction,
+        raw_atr,
+        validated_atr,
+        fallback_used,
+        sl_distance,
+        tp_distance,
+        sl,
+        tp,
+        pip_size,
+        tp_pips,
+    )
+
+    return round(sl, 2), round(tp, 2), sl_pips, tp_pips
 
 
 # ============================================
