@@ -909,6 +909,76 @@ class PredictorRegressionTests(unittest.TestCase):
             app_module.latest_prediction["signalValidation"]["suppressionReasons"],
         )
 
+    def test_generate_prediction_checks_live_price_risk_before_signal_recalculation(self):
+        timestamp = datetime(2026, 4, 30, 9, 2, tzinfo=timezone.utc)
+        app_module.active_trade_state = {
+            "direction": "SHORT",
+            "action": "SHORT_ACTIVE",
+            "entryPrice": 4560.0,
+            "stopLoss": 4568.08,
+            "takeProfit": 4544.0,
+            "signalPrice": 4560.0,
+            "createdAt": "2026-04-30T08:59:00+00:00",
+            "lastConfirmedScore": 72,
+            "lastConfirmedConfidence": 95,
+            "lastConfirmedTradeability": "High",
+            "status": "OPEN",
+        }
+
+        with mock.patch.object(app_module, "datetime", self.fixed_datetime(timestamp)):
+            with mock.patch.object(app_module, "fetch_live_price", return_value=4568.09):
+                with mock.patch.object(app_module, "fetch_xauusd_data") as mocked_candles:
+                    with mock.patch.object(app_module, "compute_prediction") as mocked_compute:
+                        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+                            app_module.generate_prediction(notify=True)
+
+        mocked_candles.assert_not_called()
+        mocked_compute.assert_not_called()
+        self.assertTrue(app_module.risk_state["slHit"])
+        self.assertEqual(app_module.risk_state["exitReason"], "SL_HIT")
+        self.assertEqual(app_module.latest_prediction["actionState"], "WAIT")
+        mocked_push.assert_called_once()
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD stop loss hit")
+
+    def test_generate_prediction_uses_current_intrabar_candle_after_grace_window(self):
+        fixed_now = datetime(2026, 4, 30, 9, 20, tzinfo=timezone.utc)
+        index = pd.date_range(
+            end=pd.Timestamp("2026-04-30T09:00:00Z"),
+            periods=120,
+            freq="h",
+            tz="UTC",
+        )
+        frame = self.build_frame(index=index)
+        frame.iloc[-1, frame.columns.get_loc("Open")] = 2402.0
+        frame.iloc[-1, frame.columns.get_loc("High")] = 2403.0
+        frame.iloc[-1, frame.columns.get_loc("Low")] = 2401.0
+        frame.iloc[-1, frame.columns.get_loc("Close")] = 2402.5
+        frame.iloc[-1, frame.columns.get_loc("Volume")] = 10.0
+
+        def fake_compute(signal_df, params=None):
+            self.assertEqual(signal_df.index[-1], pd.Timestamp("2026-04-30T09:00:00Z"))
+            self.assertEqual(
+                signal_df.attrs.get("candle_used_for_signal"),
+                "2026-04-30T09:00:00+00:00",
+            )
+            self.assertFalse(signal_df.attrs.get("excluded_current_candle"))
+            self.assertFalse(signal_df.attrs.get("grace_period_active"))
+            return self.wait_prediction(
+                score=35,
+                timestamp=fixed_now.isoformat(),
+                candle_timestamp="2026-04-30T09:00:00+00:00",
+            )
+
+        with mock.patch.object(app_module, "datetime", self.fixed_datetime(fixed_now)):
+            with mock.patch.object(app_module, "fetch_live_price", return_value=None):
+                with mock.patch.object(app_module, "fetch_xauusd_data", return_value=frame.copy()):
+                    with mock.patch.object(app_module, "compute_prediction", side_effect=fake_compute):
+                        app_module.generate_prediction(notify=False)
+
+        self.assertEqual(app_module.latest_prediction["candle_used_for_signal"], "2026-04-30T09:00:00+00:00")
+        self.assertFalse(app_module.latest_prediction["excluded_current_candle"])
+        self.assertFalse(app_module.latest_prediction["grace_period_active"])
+
     def test_short_stop_loss_triggers_immediately_during_grace_period(self):
         timestamp = datetime(2026, 4, 30, 9, 2, tzinfo=timezone.utc)
         app_module.active_trade_state = {
