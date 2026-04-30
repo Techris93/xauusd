@@ -996,6 +996,19 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("showToast(`${change.title}", response_body)
 
+    def test_dashboard_renders_visible_bar_grace_status_band(self):
+        response = self.client.get("/")
+        response_body = response.get_data(as_text=True)
+        response.close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('id="barGraceStatus"', response_body)
+        self.assertEqual(response_body.count('id="barGraceStatus"'), 1)
+        self.assertIn('class="bar-grace-status"', response_body)
+        self.assertIn("validation.candidateGracePeriodActive", response_body)
+        self.assertIn("data.grace_period_active", response_body)
+        self.assertIn("New bar grace period active", response_body)
+
     def test_dashboard_declares_favicon_and_manifest(self):
         response = self.client.get("/")
         response_body = response.get_data(as_text=True)

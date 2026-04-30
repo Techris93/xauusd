@@ -269,6 +269,17 @@
         color: #6b7280;
         margin-top: 4px;
       }
+      .bar-grace-status {
+        margin: -8px 0 20px;
+        padding: 12px 16px;
+        border: 1px solid rgba(255, 215, 0, 0.24);
+        border-radius: 10px;
+        background: rgba(255, 215, 0, 0.08);
+        color: #f8d76b;
+        font-size: 13px;
+        font-weight: 700;
+        text-align: center;
+      }
 
       /* Chart Container */
       .chart-container {
@@ -541,6 +552,7 @@
             <div class="price-label">Last Update</div>
           </div>
         </div>
+        <div id="barGraceStatus" class="bar-grace-status" style="display: none"></div>
 
         <div class="grid">
           <!-- Verdict Card -->
@@ -572,11 +584,6 @@
             <button id="tradeBtn" class="trade-btn" disabled>
               Waiting for Signal...
             </button>
-            <div
-              id="barGraceStatus"
-              class="notification-state"
-              style="display: none; max-width: none; margin-top: 10px"
-            ></div>
           </div>
 
           <!-- Details Card -->
@@ -1378,12 +1385,32 @@
           data.barState && typeof data.barState === "object"
             ? data.barState
             : {};
-        if (graceStatus && tradeIsActive && barState.gracePeriodActive) {
-          const remainingSeconds = Number.isFinite(
-            Number(barState.graceRemainingSeconds),
-          )
-            ? Number(barState.graceRemainingSeconds)
-            : 0;
+        const validation =
+          data.signalValidation && typeof data.signalValidation === "object"
+            ? data.signalValidation
+            : {};
+        const graceActive = Boolean(
+          barState.gracePeriodActive ||
+            validation.gracePeriodActive ||
+            validation.candidateGracePeriodActive ||
+            data.grace_period_active,
+        );
+        if (graceStatus && tradeIsActive && graceActive) {
+          let remainingSeconds = Number(barState.graceRemainingSeconds);
+          const currentBarTime = Date.parse(barState.currentBarTime || "");
+          const gracePeriodSeconds = Number(barState.gracePeriodSeconds || 300);
+          if (
+            Number.isFinite(currentBarTime) &&
+            Number.isFinite(gracePeriodSeconds)
+          ) {
+            remainingSeconds = Math.max(
+              0,
+              gracePeriodSeconds - Math.floor((Date.now() - currentBarTime) / 1000),
+            );
+          }
+          if (!Number.isFinite(remainingSeconds)) {
+            remainingSeconds = gracePeriodSeconds;
+          }
           const remainingMinutes = Math.max(
             1,
             Math.ceil(remainingSeconds / 60),
