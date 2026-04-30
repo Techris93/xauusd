@@ -830,22 +830,27 @@ class PredictorRegressionTests(unittest.TestCase):
         frame.iloc[-1, frame.columns.get_loc("Volume")] = 1.0
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
-            app_module._notify_signal_change(
-                self.active_prediction(
-                    "SHORT_ACTIVE",
-                    score=72,
-                    timestamp="2026-04-30T08:58:00+00:00",
-                    candle_timestamp="2026-04-30T07:00:00+00:00",
+            with mock.patch.object(
+                app_module,
+                "datetime",
+                self.fixed_datetime(datetime(2026, 4, 30, 8, 59, tzinfo=timezone.utc)),
+            ):
+                app_module._notify_signal_change(
+                    self.active_prediction(
+                        "SHORT_ACTIVE",
+                        score=72,
+                        timestamp="2026-04-30T08:58:00+00:00",
+                        candle_timestamp="2026-04-30T07:00:00+00:00",
+                    )
                 )
-            )
-            app_module._notify_signal_change(
-                self.active_prediction(
-                    "SHORT_ACTIVE",
-                    score=72,
-                    timestamp="2026-04-30T08:59:00+00:00",
-                    candle_timestamp="2026-04-30T07:00:00+00:00",
+                app_module._notify_signal_change(
+                    self.active_prediction(
+                        "SHORT_ACTIVE",
+                        score=72,
+                        timestamp="2026-04-30T08:59:00+00:00",
+                        candle_timestamp="2026-04-30T07:00:00+00:00",
+                    )
                 )
-            )
             self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
             mocked_push.reset_mock()
 
@@ -1051,6 +1056,18 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIn("data.grace_period_active", response_body)
         self.assertIn("New bar grace period active", response_body)
 
+    def test_dashboard_prediction_fetch_cannot_use_cached_or_out_of_order_response(self):
+        response = self.client.get("/")
+        response_body = response.get_data(as_text=True)
+        response.close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("let predictionFetchSequence = 0", response_body)
+        self.assertIn("let latestRenderedFetchSequence = 0", response_body)
+        self.assertIn('cache: "no-store"', response_body)
+        self.assertIn('"Cache-Control": "no-cache"', response_body)
+        self.assertIn("fetchSequence < latestRenderedFetchSequence", response_body)
+
     def test_dashboard_declares_favicon_and_manifest(self):
         response = self.client.get("/")
         response_body = response.get_data(as_text=True)
@@ -1084,6 +1101,14 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(payload.get("workerPath"), "/notification-sw.js")
         if payload.get("pushAvailable"):
             self.assertTrue(payload.get("vapidPublicKey"))
+
+    def test_prediction_route_disables_http_caching(self):
+        response = self.client.get("/api/prediction")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("no-store", response.headers.get("Cache-Control", ""))
+        self.assertEqual(response.headers.get("Pragma"), "no-cache")
+        self.assertEqual(response.headers.get("Expires"), "0")
 
     def test_notification_test_route_is_not_exposed(self):
         response = self.client.post("/api/notifications/test", json={})
@@ -1489,6 +1514,88 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(mocked_push.call_count, 1)
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD signal paused")
         self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+
+    def test_post_grace_pause_notification_cannot_diverge_from_dashboard_state(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+
+        def publish_like_scheduler(raw_prediction, offset):
+            now = datetime.fromisoformat(self.iso_at(offset))
+            stabilized_prediction = app_module._ensure_stabilized_signal_prediction(
+                raw_prediction,
+                status="active",
+                now=now,
+                advance=True,
+            )
+            app_module.latest_prediction = app_module._json_safe(
+                app_module._attach_runtime_state(stabilized_prediction)
+            )
+            app_module.last_update = now
+            app_module._notify_signal_change(app_module.latest_prediction)
+
+            dashboard_prediction = app_module._ensure_stabilized_signal_prediction(
+                {
+                    **app_module.latest_prediction,
+                    "status": "active",
+                    "error": None,
+                    "warning": None,
+                },
+                status="active",
+                now=now,
+                advance=False,
+            )
+            return app_module._build_server_signal_snapshot(dashboard_prediction)
+
+        def post_grace_weak_prediction(offset):
+            prediction = self.wait_prediction(
+                score=25,
+                timestamp=self.iso_at(offset),
+                candle_timestamp=self.iso_at(offset),
+            )
+            prediction.update(
+                {
+                    "signal_snapshot_id": f"post-grace-long-weak-{offset}",
+                    "calculation_time": self.iso_at(offset),
+                    "latest_provider_candle_time": self.iso_at(offset),
+                    "last_closed_candle_time": self.iso_at(0),
+                    "candle_used_for_signal": self.iso_at(offset),
+                    "candle_is_closed": False,
+                    "grace_period_active": False,
+                }
+            )
+            return prediction
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            publish_like_scheduler(
+                self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(1)),
+                1,
+            )
+            publish_like_scheduler(
+                self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(2)),
+                2,
+            )
+            self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
+            mocked_push.reset_mock()
+
+            first_dashboard_snapshot = publish_like_scheduler(post_grace_weak_prediction(301), 301)
+            mocked_push.assert_not_called()
+            self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
+            self.assertEqual(first_dashboard_snapshot["actionState"], "LONG_ACTIVE")
+            self.assertFalse(app_module.last_push_snapshot["notificationAllowed"])
+            self.assertIn(
+                "waiting for deactivation confirmation",
+                "; ".join(app_module.last_push_snapshot["suppressionReasons"]),
+            )
+
+            second_dashboard_snapshot = publish_like_scheduler(post_grace_weak_prediction(302), 302)
+
+        self.assertEqual(mocked_push.call_count, 1)
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD signal paused")
+        self.assertIn("Action LONG_ACTIVE -> WAIT", mocked_push.call_args.args[1])
+        self.assertIn("New blockers detected", mocked_push.call_args.args[1])
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertEqual(second_dashboard_snapshot["actionState"], "WAIT")
+        self.assertEqual(second_dashboard_snapshot["verdict"], "Neutral")
+        self.assertTrue(second_dashboard_snapshot["hasBlockers"])
 
     def test_signal_survives_after_grace_when_score_remains_valid(self):
         app_module.last_push_snapshot = self.wait_snapshot()

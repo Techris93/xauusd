@@ -634,6 +634,8 @@
       let priceChart = null;
       let refreshInterval = null;
       let previousSignalSnapshot = null;
+      let predictionFetchSequence = 0;
+      let latestRenderedFetchSequence = 0;
       let notificationWorkerRegistration = null;
       let notificationWorkerError = null;
       let pushConfig = null;
@@ -1234,9 +1236,19 @@
       }
 
       async function fetchPrediction() {
+        const fetchSequence = ++predictionFetchSequence;
         try {
-          const response = await fetch("/api/prediction");
+          const response = await fetch("/api/prediction", {
+            cache: "no-store",
+            headers: {
+              "Cache-Control": "no-cache",
+            },
+          });
           const data = await response.json();
+          if (fetchSequence < latestRenderedFetchSequence) {
+            return;
+          }
+          latestRenderedFetchSequence = fetchSequence;
           updateDashboard(data);
         } catch (error) {
           console.error("Fetch error:", error);

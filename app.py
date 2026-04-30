@@ -182,6 +182,14 @@ def _json_safe(value):
     return value
 
 
+def _no_store_json(payload):
+    response = jsonify(_json_safe(payload))
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
 def _urlsafe_b64encode(raw_bytes):
     return base64.urlsafe_b64encode(raw_bytes).rstrip(b"=").decode("ascii")
 
@@ -2218,7 +2226,7 @@ def api_prediction():
     _ensure_prediction_fresh()
 
     if latest_prediction is None:
-        return jsonify({
+        return _no_store_json({
             "verdict": "Neutral",
             "confidence": 50,
             "status": "initializing",
@@ -2244,7 +2252,7 @@ def api_prediction():
     response = _ensure_stabilized_signal_prediction(response, status=status, advance=False)
     response = _attach_runtime_state(response)
 
-    return jsonify(_json_safe(response))
+    return _no_store_json(response)
 
 
 @app.route("/api/health")
