@@ -33,6 +33,7 @@ class PredictorRegressionTests(unittest.TestCase):
     def setUp(self):
         app_module.latest_prediction = None
         app_module.last_update = None
+        app_module.last_price_update = None
         app_module.error_state = None
         app_module.last_push_snapshot = None
         app_module.last_notification = {"key": None, "time": None}
@@ -53,6 +54,7 @@ class PredictorRegressionTests(unittest.TestCase):
     def tearDown(self):
         app_module.latest_prediction = None
         app_module.last_update = None
+        app_module.last_price_update = None
         app_module.error_state = None
         app_module.last_push_snapshot = None
         app_module.last_notification = {"key": None, "time": None}
@@ -723,12 +725,13 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.error_state = None
 
         def fake_generate_prediction(notify=True):
-            self.assertFalse(notify)
+            self.assertTrue(notify)
             app_module.latest_prediction = {
                 "verdict": "Bullish",
                 "confidence": 91,
                 "timestamp": fresh_iso,
                 "lastUpdate": fresh_iso,
+                "predictionUpdatedAt": fresh_iso,
                 "dataSource": "Twelve Data",
                 "symbol": app_module.DEFAULT_SYMBOL,
             }
@@ -743,7 +746,7 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(payload.get("status"), "active")
         self.assertEqual(payload.get("timestamp"), fresh_iso)
         self.assertEqual(payload.get("verdict"), "Bullish")
-        mocked_generate.assert_called_once_with(notify=False)
+        mocked_generate.assert_called_once_with(notify=True)
 
     def test_refresh_failure_keeps_last_good_prediction_visible(self):
         fresh_time = datetime.now(timezone.utc)
@@ -783,6 +786,33 @@ class PredictorRegressionTests(unittest.TestCase):
 
         self.assertIsNotNone(app_module.last_push_snapshot)
         mocked_push.assert_not_called()
+
+    def test_live_price_tick_does_not_overwrite_prediction_timestamp(self):
+        prediction_time = datetime(2026, 4, 30, 10, 0, tzinfo=timezone.utc)
+        price_time = datetime(2026, 4, 30, 10, 1, tzinfo=timezone.utc)
+        prediction_iso = prediction_time.isoformat()
+        app_module.latest_prediction = {
+            "verdict": "Bullish",
+            "confidence": 78,
+            "currentPrice": 4620.01,
+            "timestamp": prediction_iso,
+            "lastUpdate": prediction_iso,
+            "predictionUpdatedAt": prediction_iso,
+            "dataSource": "Twelve Data",
+            "symbol": app_module.DEFAULT_SYMBOL,
+            "forecast": {"score": 55},
+        }
+        app_module.last_update = prediction_time
+
+        app_module._process_live_price_tick(4621.71, price_time, notify=True)
+
+        self.assertEqual(app_module.latest_prediction["currentPrice"], 4621.71)
+        self.assertEqual(app_module.latest_prediction["timestamp"], prediction_iso)
+        self.assertEqual(app_module.latest_prediction["lastUpdate"], prediction_iso)
+        self.assertEqual(app_module.latest_prediction["predictionUpdatedAt"], prediction_iso)
+        self.assertEqual(app_module.latest_prediction["priceUpdatedAt"], price_time.isoformat())
+        self.assertEqual(app_module.last_update, prediction_time)
+        self.assertEqual(app_module.last_price_update, price_time)
 
     def test_bar_open_generate_uses_intrabar_candle_but_preserves_active_signal_during_grace(self):
         fixed_now = datetime(2026, 4, 30, 9, 1, tzinfo=timezone.utc)

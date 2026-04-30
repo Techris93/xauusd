@@ -139,6 +139,7 @@ SIGNAL_STABILIZATION_CONFIG = {
 
 latest_prediction = None
 last_update = None
+last_price_update = None
 error_state = None
 last_push_snapshot = None
 last_notification = {"key": None, "time": None}
@@ -1503,7 +1504,7 @@ def _commit_risk_exit(active_signal, current_price, reason, timestamp, notify=Tr
 
 
 def _update_latest_live_price(current_price, timestamp):
-    global latest_prediction, last_update
+    global latest_prediction, last_price_update
 
     current_price = _finite_float(current_price)
     if current_price is None or not _has_usable_prediction():
@@ -1511,10 +1512,9 @@ def _update_latest_live_price(current_price, timestamp):
 
     latest_prediction = dict(latest_prediction)
     latest_prediction["currentPrice"] = round(current_price, 2)
-    latest_prediction["timestamp"] = timestamp.isoformat()
-    latest_prediction["lastUpdate"] = timestamp.isoformat()
+    latest_prediction["priceUpdatedAt"] = timestamp.isoformat()
     latest_prediction = _json_safe(_attach_runtime_state(latest_prediction))
-    last_update = timestamp
+    last_price_update = timestamp
 
 
 def _process_live_price_tick(current_price, timestamp=None, notify=True):
@@ -1603,7 +1603,7 @@ def _ensure_prediction_fresh():
             "Cached prediction is stale by more than %s; refreshing on demand.",
             MAX_PREDICTION_STALENESS,
         )
-        generate_prediction(notify=False)
+        generate_prediction(notify=True)
         return True
 
 
@@ -2035,6 +2035,9 @@ def generate_prediction(notify=True):
 
             prediction["timestamp"] = now_iso
             prediction["lastUpdate"] = now_iso
+            prediction["predictionUpdatedAt"] = now_iso
+            if live_price is not None:
+                prediction["priceUpdatedAt"] = now_iso
             prediction["dataPoints"] = len(df)
             prediction["providerDataPoints"] = len(provider_df)
             prediction["timeframe"] = DEFAULT_INTERVAL
@@ -2089,6 +2092,7 @@ def generate_prediction(notify=True):
                 "confidence": 50,
                 "error": str(exc),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "predictionUpdatedAt": None,
                 "dataSource": "Twelve Data",
                 "symbol": DEFAULT_SYMBOL,
             }
@@ -2212,6 +2216,7 @@ def health_check():
         "dataSource": "Twelve Data",
         "symbol": DEFAULT_SYMBOL,
         "timeframe": DEFAULT_INTERVAL,
+        "priceUpdatedAt": last_price_update.isoformat() if last_price_update else None,
     }))
 
 

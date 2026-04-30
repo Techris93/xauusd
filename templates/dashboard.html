@@ -1276,8 +1276,10 @@
           tradeIsActive && data.entryPrice
           ? "$" + data.entryPrice.toLocaleString()
           : "--";
-        document.getElementById("lastUpdate").textContent = data.timestamp
-          ? new Date(data.timestamp).toLocaleTimeString()
+        const predictionUpdatedAt =
+          data.predictionUpdatedAt || data.lastUpdate || data.timestamp;
+        document.getElementById("lastUpdate").textContent = predictionUpdatedAt
+          ? new Date(predictionUpdatedAt).toLocaleTimeString()
           : "--";
 
         const verdictEl = document.getElementById("verdictText");
