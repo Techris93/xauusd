@@ -711,44 +711,12 @@ def calculate_stop_loss_take_profit(current_price, direction, df, params):
 def compute_prediction(df, params=None):
     """
     Main prediction function - streamlined and fixed.
-    The caller must pass a frame of fully closed candles; incomplete-candle
-    metadata is treated as a hard WAIT guard so partial bars cannot score trades.
+    The caller may pass the current intrabar frame so live price/risk handling
+    stays reactive. Bar-open stability is handled by the app-level state guard,
+    not by forcing incomplete candles to WAIT here.
     """
     params = {**DEFAULT_PARAMS, **(params or {})}
     signal_metadata = _frame_signal_metadata(df)
-
-    if signal_metadata.get("candle_is_closed") is False:
-        return {
-            **signal_metadata,
-            "verdict": "Neutral",
-            "confidence": 50,
-            "tradeability": 0,
-            "tradeabilityScore": 0,
-            "tradeabilityLabel": "Low",
-            "action": "hold",
-            "actionState": "WAIT",
-            "reason": "Incomplete candle excluded from signal calculation",
-            "blockers": ["suppressed_incomplete_candle"],
-            "signals": [],
-            "currentPrice": None,
-            "entryPrice": None,
-            "stopLoss": None,
-            "takeProfit": None,
-            "slPips": None,
-            "tpPips": None,
-            "rrRatio": None,
-            "forecast": {
-                "directionalBias": "Neutral",
-                "confidence": 50,
-                "score": 0,
-                "signals": [],
-            },
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "signalState": signal_state.current_signal,
-            "holdTimeMinutes": signal_state.hold_time_minutes(),
-            "flipsToday": signal_state.flip_count,
-            "antiFlipReason": "suppressed_incomplete_candle",
-        }
 
     if df.empty or len(df) < 20:
         return {

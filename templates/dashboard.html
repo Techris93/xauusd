@@ -572,6 +572,11 @@
             <button id="tradeBtn" class="trade-btn" disabled>
               Waiting for Signal...
             </button>
+            <div
+              id="barGraceStatus"
+              class="notification-state"
+              style="display: none; max-width: none; margin-top: 10px"
+            ></div>
           </div>
 
           <!-- Details Card -->
@@ -1364,6 +1369,28 @@
           tradeBtn.textContent = "Waiting for Signal...";
           tradeBtn.className = "trade-btn";
           tradeBtn.disabled = true;
+        }
+
+        const graceStatus = document.getElementById("barGraceStatus");
+        const barState =
+          data.barState && typeof data.barState === "object"
+            ? data.barState
+            : {};
+        if (graceStatus && tradeIsActive && barState.gracePeriodActive) {
+          const remainingSeconds = Number.isFinite(
+            Number(barState.graceRemainingSeconds),
+          )
+            ? Number(barState.graceRemainingSeconds)
+            : 0;
+          const remainingMinutes = Math.max(
+            1,
+            Math.ceil(remainingSeconds / 60),
+          );
+          graceStatus.style.display = "block";
+          graceStatus.textContent = `New bar grace period active: ${remainingMinutes} min remaining`;
+        } else if (graceStatus) {
+          graceStatus.style.display = "none";
+          graceStatus.textContent = "";
         }
 
         if (data.chartData) {
