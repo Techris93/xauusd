@@ -747,20 +747,9 @@
           score: score,
           signals: signals,
           signalsKey: normalizedSignals.join("|"),
+          blockers: blockers,
           hasBlockers: blockers.length > 0,
         };
-      }
-
-      function displayScore(data) {
-        const validation =
-          data && data.signalValidation && typeof data.signalValidation === "object"
-            ? data.signalValidation
-            : {};
-        return Number.isFinite(Number(validation.score))
-          ? Number(validation.score)
-          : Number.isFinite(Number(data && data.forecast && data.forecast.score))
-            ? Number(data.forecast.score)
-          : 0;
       }
 
       function buildAlertTitle(previous, current) {
@@ -1246,6 +1235,19 @@
       function updateDashboard(data) {
         document.getElementById("loadingState").style.display = "none";
         document.getElementById("mainContent").style.display = "block";
+        const signalSnapshot = buildSignalSnapshot(data) || {
+          verdict: "Neutral",
+          action: "hold",
+          actionState: "WAIT",
+          tradeabilityLabel: "Low",
+          confidence: 50,
+          score: 0,
+          blockers: [],
+          hasBlockers: false,
+        };
+        const tradeIsActive =
+          isActionableState(signalSnapshot.actionState) &&
+          !signalSnapshot.hasBlockers;
 
         const statusBadge = document.getElementById("statusBadge");
         if (data.error) {
@@ -1265,7 +1267,8 @@
         document.getElementById("currentPrice").textContent = data.currentPrice
           ? "$" + data.currentPrice.toLocaleString()
           : "--";
-        document.getElementById("signalPrice").textContent = data.entryPrice
+        document.getElementById("signalPrice").textContent =
+          tradeIsActive && data.entryPrice
           ? "$" + data.entryPrice.toLocaleString()
           : "--";
         document.getElementById("lastUpdate").textContent = data.timestamp
@@ -1273,21 +1276,21 @@
           : "--";
 
         const verdictEl = document.getElementById("verdictText");
-        verdictEl.textContent = data.verdict || "Neutral";
+        verdictEl.textContent = signalSnapshot.verdict || "Neutral";
         verdictEl.className =
           "verdict-text " +
-          (data.verdict === "Bullish"
+          (signalSnapshot.verdict === "Bullish"
             ? "verdict-bullish"
-            : data.verdict === "Bearish"
+            : signalSnapshot.verdict === "Bearish"
               ? "verdict-bearish"
               : "verdict-neutral");
 
-        const confidence = data.confidence || 50;
+        const confidence = signalSnapshot.confidence || 50;
         const ringEl = document.getElementById("confidenceRing");
         const ringColor =
-          data.verdict === "Bullish"
+          signalSnapshot.verdict === "Bullish"
             ? "#00ff88"
-            : data.verdict === "Bearish"
+            : signalSnapshot.verdict === "Bearish"
               ? "#ff4444"
               : "#6b7280";
         ringEl.style.setProperty("--ring-color", ringColor);
@@ -1299,8 +1302,9 @@
           confidence + "%";
 
         document.getElementById("tradeabilityScore").textContent =
-          data.tradeabilityLabel || "Low";
-        document.getElementById("scoreValue").textContent = displayScore(data);
+          signalSnapshot.tradeabilityLabel || "Low";
+        document.getElementById("scoreValue").textContent =
+          signalSnapshot.score;
         document.getElementById("rrValue").textContent = data.rrRatio || "--";
 
         const signalList = document.getElementById("signalList");
@@ -1325,16 +1329,18 @@
           signalList.replaceChildren(item);
         }
 
-        document.getElementById("slValue").textContent = data.stopLoss || "--";
+        document.getElementById("slValue").textContent =
+          tradeIsActive && data.stopLoss ? data.stopLoss : "--";
         document.getElementById("tpValue").textContent =
-          data.takeProfit || "--";
-        document.getElementById("pipValue").textContent = data.tpPips || "--";
+          tradeIsActive && data.takeProfit ? data.takeProfit : "--";
+        document.getElementById("pipValue").textContent =
+          tradeIsActive && data.tpPips ? data.tpPips : "--";
 
         const blockersSection = document.getElementById("blockersSection");
-        if (data.blockers && data.blockers.length > 0) {
+        if (signalSnapshot.blockers && signalSnapshot.blockers.length > 0) {
           blockersSection.style.display = "block";
           document.getElementById("blockerList").replaceChildren(
-            ...data.blockers.map((blocker) => {
+            ...signalSnapshot.blockers.map((blocker) => {
               const item = document.createElement("li");
               item.className = "blocker-item";
               item.textContent = `Warning: ${String(blocker || "")}`;
@@ -1346,11 +1352,11 @@
         }
 
         const tradeBtn = document.getElementById("tradeBtn");
-        if (data.action === "buy") {
+        if (tradeIsActive && signalSnapshot.action === "buy") {
           tradeBtn.textContent = "🚀 ENTER LONG";
           tradeBtn.className = "trade-btn buy";
           tradeBtn.disabled = false;
-        } else if (data.action === "sell") {
+        } else if (tradeIsActive && signalSnapshot.action === "sell") {
           tradeBtn.textContent = "🔻 ENTER SHORT";
           tradeBtn.className = "trade-btn sell";
           tradeBtn.disabled = false;
@@ -1361,7 +1367,7 @@
         }
 
         if (data.chartData) {
-          updateChart(data.chartData, data.verdict);
+          updateChart(data.chartData, signalSnapshot.verdict);
         }
 
         handleImportantSignalChange(data);

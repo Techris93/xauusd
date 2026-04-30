@@ -1,4 +1,4 @@
-self.SIGNAL_PUSH_PAYLOAD_VERSION = "authoritative-signal-v1";
+self.SIGNAL_PUSH_PAYLOAD_VERSION = "authoritative-signal-v2";
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());
@@ -28,6 +28,19 @@ self.addEventListener("push", (event) => {
   ) {
     console.warn("Ignoring stale signal push payload.");
     return;
+  }
+  if (tag === "xauusd-important-signal") {
+    const createdAt = Date.parse(payload.createdAt || "");
+    const maxAgeSeconds = Number.isFinite(Number(payload.maxAgeSeconds))
+      ? Number(payload.maxAgeSeconds)
+      : 300;
+    if (
+      !Number.isFinite(createdAt) ||
+      Date.now() - createdAt > maxAgeSeconds * 1000
+    ) {
+      console.warn("Ignoring expired signal push payload.");
+      return;
+    }
   }
 
   const title = payload.title || "XAU/USD signal update";

@@ -154,6 +154,25 @@ class PredictorRegressionTests(unittest.TestCase):
             payload["ATR_14"] = [atr_value]
         return pd.DataFrame(payload)
 
+    @staticmethod
+    def ohlcv_frame(index=None, **overrides):
+        if index is None:
+            index = pd.date_range(
+                start=pd.Timestamp("2026-04-30T08:00:00Z"),
+                periods=3,
+                freq="h",
+                tz="UTC",
+            )
+        payload = {
+            "Open": [2400.0, 2401.0, 2402.0],
+            "High": [2401.0, 2402.0, 2403.0],
+            "Low": [2399.0, 2400.0, 2401.0],
+            "Close": [2400.5, 2401.5, 2402.5],
+            "Volume": [1000.0, 1000.0, 1000.0],
+        }
+        payload.update(overrides)
+        return pd.DataFrame(payload, index=index)
+
     def test_prepare_data_assigns_nearest_levels_without_existing_columns(self):
         prepared = prepare_data(self.build_frame())
 
@@ -192,6 +211,66 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIn("Volume", prepared.columns)
         self.assertTrue((prepared["Volume"] == 0.0).all())
         self.assertFalse(prepared["VWAP"].tail(10).isna().any())
+
+    def test_normalize_ohlcv_frame_sorts_descending_timestamps(self):
+        frame = self.ohlcv_frame().iloc[::-1]
+
+        normalized = app_module.normalize_ohlcv_frame(frame)
+
+        self.assertTrue(normalized.index.is_monotonic_increasing)
+
+    def test_normalize_ohlcv_frame_rejects_duplicate_timestamps(self):
+        index = pd.DatetimeIndex(
+            [
+                pd.Timestamp("2026-04-30T08:00:00Z"),
+                pd.Timestamp("2026-04-30T09:00:00Z"),
+                pd.Timestamp("2026-04-30T09:00:00Z"),
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "Duplicate candle timestamps"):
+            app_module.normalize_ohlcv_frame(self.ohlcv_frame(index=index))
+
+    def test_normalize_ohlcv_frame_rejects_mixed_out_of_order_timestamps(self):
+        index = pd.DatetimeIndex(
+            [
+                pd.Timestamp("2026-04-30T08:00:00Z"),
+                pd.Timestamp("2026-04-30T10:00:00Z"),
+                pd.Timestamp("2026-04-30T09:00:00Z"),
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "Out-of-order candle timestamps"):
+            app_module.normalize_ohlcv_frame(self.ohlcv_frame(index=index))
+
+    def test_normalize_ohlcv_frame_rejects_non_finite_ohlc_values(self):
+        frame = self.ohlcv_frame(Close=[2400.5, float("nan"), 2402.5])
+
+        with self.assertRaisesRegex(ValueError, "Non-finite OHLC values"):
+            app_module.normalize_ohlcv_frame(frame)
+
+    def test_normalize_ohlcv_frame_rejects_invalid_ohlc_range(self):
+        frame = self.ohlcv_frame(High=[2401.0, 2399.0, 2403.0])
+
+        with self.assertRaisesRegex(ValueError, "Invalid OHLC candle range"):
+            app_module.normalize_ohlcv_frame(frame)
+
+    def test_normalize_ohlcv_frame_rejects_absurd_ohlc_range(self):
+        frame = self.ohlcv_frame(High=[2401.0, 3500.0, 2403.0], Low=[2399.0, 1000.0, 2401.0])
+
+        with self.assertRaisesRegex(ValueError, "Absurd OHLC candle range"):
+            app_module.normalize_ohlcv_frame(frame)
+
+    def test_latest_candle_freshness_rejects_stale_hourly_candle(self):
+        index = pd.date_range(
+            end=pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=8),
+            periods=3,
+            freq="h",
+        )
+        normalized = app_module.normalize_ohlcv_frame(self.ohlcv_frame(index=index))
+
+        with self.assertRaisesRegex(ValueError, "Latest Twelve Data candle is stale"):
+            app_module._validate_latest_candle_freshness(normalized, "1h")
 
     def test_stop_loss_take_profit_uses_fallback_for_corrupted_high_atr(self):
         sl, tp, sl_pips, tp_pips = calculate_stop_loss_take_profit(
@@ -562,6 +641,7 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertNotIn("hasVisibleClient", response_body)
         self.assertIn("SIGNAL_PUSH_PAYLOAD_VERSION", response_body)
         self.assertIn("Ignoring stale signal push payload", response_body)
+        self.assertIn("Ignoring expired signal push payload", response_body)
 
     def test_dashboard_does_not_show_duplicate_in_app_signal_toasts(self):
         response = self.client.get("/")
@@ -755,6 +835,42 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
         self.assertIn("risk management is incomplete", app_module.last_push_snapshot["blockers"])
 
+    def test_stale_cached_signal_cannot_trigger_active_notification(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+        active_prediction = self.active_prediction("SHORT_ACTIVE", score=90)
+        active_prediction["status"] = "stale"
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(active_prediction)
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertEqual(app_module.last_push_snapshot["verdict"], "Neutral")
+        self.assertIn("app status is stale", app_module.last_push_snapshot["blockers"])
+
+    def test_low_tradeability_suppresses_active_alert(self):
+        app_module.last_push_snapshot = self.wait_snapshot()
+        active_prediction = self.active_prediction("LONG_ACTIVE", score=90)
+        active_prediction["tradeabilityLabel"] = "Low"
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(active_prediction)
+
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertIn("tradeability is Low", app_module.last_push_snapshot["blockers"])
+
+    def test_displayed_score_matches_score_used_by_validation_and_blockers(self):
+        raw_prediction = self.active_prediction("SHORT_ACTIVE", score=25)
+
+        dashboard_prediction = app_module._apply_authoritative_signal_state(raw_prediction)
+        notification_snapshot = app_module._build_server_signal_snapshot(raw_prediction)
+
+        self.assertEqual(dashboard_prediction["forecast"]["score"], 25.0)
+        self.assertEqual(dashboard_prediction["signalValidation"]["score"], 25.0)
+        self.assertEqual(notification_snapshot["score"], 25.0)
+        self.assertIn("signal score 25 below threshold 45", dashboard_prediction["blockers"])
+
     def test_web_push_config_derives_public_key_when_env_key_is_mismatched(self):
         private_key = app_module.ec.generate_private_key(app_module.ec.SECP256R1())
         private_key_b64 = app_module._urlsafe_b64encode(
@@ -843,6 +959,8 @@ class PredictorRegressionTests(unittest.TestCase):
 
         payload = json.loads(mocked_webpush.call_args.kwargs["data"])
         self.assertEqual(payload["version"], app_module.SIGNAL_PUSH_PAYLOAD_VERSION)
+        self.assertEqual(payload["maxAgeSeconds"], app_module.SIGNAL_PUSH_MAX_AGE_SECONDS)
+        self.assertIsNotNone(datetime.fromisoformat(payload["createdAt"]))
 
     def test_notification_subscription_routes_roundtrip(self):
         sample_subscription = {

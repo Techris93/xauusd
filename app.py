@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from urllib.parse import urlparse
 
+import numpy as np
 import pandas as pd
 from apscheduler.schedulers.background import BackgroundScheduler
 from cryptography.hazmat.primitives import serialization
@@ -99,7 +100,9 @@ MAX_PUSH_KEY_BYTES = 512
 MAX_PUSH_SUBSCRIPTIONS = 200
 NOTIFICATION_DEDUPE_SECONDS = 300
 ACTIVE_ACTION_STATES = {"LONG_ACTIVE", "SHORT_ACTIVE"}
-SIGNAL_PUSH_PAYLOAD_VERSION = "authoritative-signal-v1"
+SIGNAL_PUSH_PAYLOAD_VERSION = "authoritative-signal-v2"
+SIGNAL_PUSH_MAX_AGE_SECONDS = 300
+MAX_OHLC_RANGE_RATIO = 0.20
 
 latest_prediction = None
 last_update = None
@@ -427,7 +430,7 @@ def _build_authoritative_signal_state(prediction, status=None):
             take_profit,
         ):
             suppression_reasons.append("risk management values are invalid")
-        if app_status in {"initializing", "error"}:
+        if app_status != "active":
             suppression_reasons.append(f"app status is {app_status}")
 
     active_trade = raw_action_state in ACTIVE_ACTION_STATES and not suppression_reasons
@@ -464,6 +467,7 @@ def _build_authoritative_signal_state(prediction, status=None):
         "stopLoss": stop_loss,
         "takeProfit": take_profit,
         "suppressionReasons": suppression_reasons,
+        "dataStatus": app_status,
     }
 
 
@@ -522,6 +526,7 @@ def _build_server_signal_snapshot(prediction):
         "isActionable": bool(validation.get("activeTrade")),
         "suppressionReasons": list(validation.get("suppressionReasons") or []),
         "displayStatus": validation.get("displayStatus") or "Waiting for Signal",
+        "dataStatus": validation.get("dataStatus") or "active",
         "timestamp": normalized.get("lastUpdate") or normalized.get("timestamp"),
     }
 
@@ -709,6 +714,8 @@ def _send_web_push_notification(title, body, severity):
     payload = json.dumps(
         {
             "version": SIGNAL_PUSH_PAYLOAD_VERSION,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+            "maxAgeSeconds": SIGNAL_PUSH_MAX_AGE_SECONDS,
             "title": title,
             "body": body,
             "url": "/",
@@ -877,6 +884,74 @@ def _to_utc_datetime_index(values):
     return parsed.tz_convert(TD_OUTPUT_TIMEZONE)
 
 
+def _validate_ohlcv_quality(df):
+    required_columns = ["Open", "High", "Low", "Close"]
+    missing_columns = [column for column in required_columns if column not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing OHLC columns from Twelve Data: {', '.join(missing_columns)}")
+
+    if df.index.has_duplicates:
+        raise ValueError("Duplicate candle timestamps returned by Twelve Data")
+    if not (df.index.is_monotonic_increasing or df.index.is_monotonic_decreasing):
+        raise ValueError("Out-of-order candle timestamps returned by Twelve Data")
+
+    ohlc = df[required_columns]
+    finite_mask = np.isfinite(ohlc.to_numpy(dtype=float)).all(axis=1)
+    if not bool(finite_mask.all()):
+        raise ValueError("Non-finite OHLC values returned by Twelve Data")
+
+    positive_mask = (ohlc > 0).all(axis=1)
+    if not bool(positive_mask.all()):
+        raise ValueError("Non-positive OHLC values returned by Twelve Data")
+
+    range_mask = (
+        (df["High"] >= df["Low"])
+        & (df["High"] >= df["Open"])
+        & (df["High"] >= df["Close"])
+        & (df["Low"] <= df["Open"])
+        & (df["Low"] <= df["Close"])
+    )
+    if not bool(range_mask.all()):
+        raise ValueError("Invalid OHLC candle range returned by Twelve Data")
+
+    candle_range = df["High"] - df["Low"]
+    if not bool((candle_range <= df["Close"].abs() * MAX_OHLC_RANGE_RATIO).all()):
+        raise ValueError("Absurd OHLC candle range returned by Twelve Data")
+
+
+def _interval_duration(interval):
+    raw = str(interval or "").strip().lower()
+    mapping = {
+        "15min": timedelta(minutes=15),
+        "15m": timedelta(minutes=15),
+        "1h": timedelta(hours=1),
+        "60min": timedelta(hours=1),
+        "60m": timedelta(hours=1),
+        "4h": timedelta(hours=4),
+        "240min": timedelta(hours=4),
+        "240m": timedelta(hours=4),
+        "1day": timedelta(days=1),
+        "1d": timedelta(days=1),
+        "1week": timedelta(weeks=1),
+        "1w": timedelta(weeks=1),
+    }
+    return mapping.get(raw)
+
+
+def _validate_latest_candle_freshness(df, interval):
+    if df.empty:
+        return
+
+    duration = _interval_duration(interval)
+    max_age = max(duration * 4, timedelta(minutes=20)) if duration else timedelta(hours=4)
+    latest_timestamp = df.index[-1]
+    latest_age = datetime.now(timezone.utc) - latest_timestamp.to_pydatetime()
+    if latest_age > max_age:
+        raise ValueError(
+            f"Latest Twelve Data candle is stale: age {latest_age} exceeds {max_age}"
+        )
+
+
 def normalize_ohlcv_frame(frame):
     if frame is None or frame.empty:
         return pd.DataFrame()
@@ -900,6 +975,7 @@ def normalize_ohlcv_frame(frame):
         df.index = df.index.tz_convert(TD_OUTPUT_TIMEZONE)
 
     df = df[~df.index.isna()]
+    _validate_ohlcv_quality(df)
 
     if "Volume" not in df.columns:
         df["Volume"] = 0.0
@@ -907,7 +983,7 @@ def normalize_ohlcv_frame(frame):
         df["Volume"] = df["Volume"].fillna(0.0)
 
     df = df.sort_index()
-    return df.dropna(subset=[column for column in ["Open", "High", "Low", "Close"] if column in df.columns])
+    return df
 
 
 def fetch_xauusd_data(period=DEFAULT_PERIOD, interval=DEFAULT_INTERVAL):
@@ -927,6 +1003,7 @@ def fetch_xauusd_data(period=DEFAULT_PERIOD, interval=DEFAULT_INTERVAL):
         df = normalize_ohlcv_frame(series.as_pandas())
         if df.empty:
             raise ValueError(f"No data returned from Twelve Data for {symbol}")
+        _validate_latest_candle_freshness(df, td_interval)
 
         logger.info("Fetched %s %s bars of %s from Twelve Data", len(df), td_interval, symbol)
         return df
