@@ -25,7 +25,6 @@ from signal_engine import (
     calculate_stop_loss_take_profit,
     detect_structure_break,
     prepare_data,
-    signal_state,
 )
 
 
@@ -37,8 +36,7 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.error_state = None
         app_module.last_push_snapshot = None
         app_module.last_notification_snapshot = None
-        app_module.last_notification = {"key": None, "time": None}
-        app_module.signal_stabilizer_state = {}
+        app_module.signal_snapshot_state = {}
         app_module.active_trade_state = None
         app_module.risk_state = {
             "slHit": False,
@@ -49,9 +47,7 @@ class PredictorRegressionTests(unittest.TestCase):
         }
         app_module.bar_state = {}
         app_module.get_web_push_config.cache_clear()
-        Path(app_module.WEB_PUSH_NOTIFICATION_STATE_PATH).unlink(missing_ok=True)
         Path(app_module.WEB_PUSH_SIGNAL_SNAPSHOT_PATH).unlink(missing_ok=True)
-        signal_state.reset()
         self.timestamp_base = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=120)
         self.client = app_module.app.test_client()
 
@@ -62,8 +58,7 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.error_state = None
         app_module.last_push_snapshot = None
         app_module.last_notification_snapshot = None
-        app_module.last_notification = {"key": None, "time": None}
-        app_module.signal_stabilizer_state = {}
+        app_module.signal_snapshot_state = {}
         app_module.active_trade_state = None
         app_module.risk_state = {
             "slHit": False,
@@ -74,9 +69,7 @@ class PredictorRegressionTests(unittest.TestCase):
         }
         app_module.bar_state = {}
         app_module.get_web_push_config.cache_clear()
-        Path(app_module.WEB_PUSH_NOTIFICATION_STATE_PATH).unlink(missing_ok=True)
         Path(app_module.WEB_PUSH_SIGNAL_SNAPSHOT_PATH).unlink(missing_ok=True)
-        signal_state.reset()
 
     @staticmethod
     def build_frame(index=None, volume=1000.0):
@@ -356,7 +349,7 @@ class PredictorRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Latest Twelve Data candle is stale"):
             app_module._validate_latest_candle_freshness(normalized, "1h")
 
-    def test_intrabar_metadata_uses_current_candle_at_0901_but_marks_grace(self):
+    def test_metadata_uses_last_closed_candle_at_0901_and_marks_grace(self):
         index = pd.DatetimeIndex(
             [
                 pd.Timestamp("2026-04-30T07:00:00Z"),
@@ -372,13 +365,14 @@ class PredictorRegressionTests(unittest.TestCase):
 
         self.assertEqual(last_closed, pd.Timestamp("2026-04-30T08:00:00Z"))
         self.assertEqual(frame.index[-1], pd.Timestamp("2026-04-30T09:00:00Z"))
-        self.assertFalse(metadata["candle_is_closed"])
+        self.assertTrue(metadata["candle_is_closed"])
         self.assertTrue(metadata["grace_period_active"])
         self.assertEqual(metadata["last_closed_candle_time"], "2026-04-30T08:00:00+00:00")
-        self.assertEqual(metadata["candle_used_for_signal"], "2026-04-30T09:00:00+00:00")
+        self.assertEqual(metadata["candle_used_for_signal"], "2026-04-30T08:00:00+00:00")
+        self.assertTrue(metadata["excluded_current_candle"])
         self.assertEqual(app_module.bar_state["gracePeriodSeconds"], 300)
 
-    def test_single_tick_current_candle_stays_intrabar_with_grace_metadata(self):
+    def test_single_tick_current_candle_is_excluded_with_grace_metadata(self):
         index = pd.DatetimeIndex(
             [
                 pd.Timestamp("2026-04-30T07:00:00Z"),
@@ -404,8 +398,8 @@ class PredictorRegressionTests(unittest.TestCase):
         )
 
         self.assertEqual(frame.index[-1], pd.Timestamp("2026-04-30T09:00:00Z"))
-        self.assertEqual(metadata["candle_used_for_signal"], "2026-04-30T09:00:00+00:00")
-        self.assertFalse(metadata["excluded_current_candle"])
+        self.assertEqual(metadata["candle_used_for_signal"], "2026-04-30T08:00:00+00:00")
+        self.assertTrue(metadata["excluded_current_candle"])
         self.assertEqual(metadata["excluded_single_tick_count"], 1)
         self.assertTrue(metadata["grace_period_active"])
 
@@ -588,7 +582,7 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIn("Breaking key support", signals)
         self.assertGreaterEqual(score, 25)
 
-    def test_signal_hysteresis_keeps_active_signal_above_exit_score(self):
+    def test_signal_engine_flips_long_to_wait_immediately(self):
         frame = self.build_signal_frame()
 
         with mock.patch.object(
@@ -596,21 +590,20 @@ class PredictorRegressionTests(unittest.TestCase):
             "calculate_anticipatory_score",
             side_effect=[
                 (80, "bullish", ["Bullish structure break"]),
-                (50, "bullish", ["Bullish structure cooling"]),
+                (35, "neutral", []),
             ],
         ):
             first_prediction = signal_module.compute_prediction(frame, app_module.DEFAULT_PARAMS)
             second_prediction = signal_module.compute_prediction(frame, app_module.DEFAULT_PARAMS)
 
         self.assertEqual(first_prediction["actionState"], "LONG_ACTIVE")
-        self.assertEqual(second_prediction["actionState"], "LONG_ACTIVE")
-        self.assertEqual(second_prediction["verdict"], "Bullish")
-        self.assertIsNone(second_prediction["antiFlipReason"])
+        self.assertEqual(second_prediction["actionState"], "WAIT")
+        self.assertEqual(second_prediction["verdict"], "Neutral")
 
-    def test_signal_engine_accepts_intrabar_frame_metadata(self):
+    def test_signal_engine_preserves_closed_candle_metadata(self):
         frame = self.build_signal_frame()
-        frame.attrs["candle_is_closed"] = False
-        frame.attrs["signal_snapshot_id"] = "incomplete-engine-frame"
+        frame.attrs["candle_is_closed"] = True
+        frame.attrs["signal_snapshot_id"] = "closed-engine-frame"
 
         with mock.patch.object(
             signal_module,
@@ -622,9 +615,9 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(prediction["actionState"], "SHORT_ACTIVE")
         self.assertEqual(prediction["verdict"], "Bearish")
         self.assertNotIn("suppressed_incomplete_candle", prediction["blockers"])
-        self.assertEqual(prediction["signal_snapshot_id"], "incomplete-engine-frame")
+        self.assertEqual(prediction["signal_snapshot_id"], "closed-engine-frame")
 
-    def test_signal_cooldown_blocks_immediate_opposite_flip(self):
+    def test_signal_engine_reverses_long_to_short_immediately(self):
         frame = self.build_signal_frame()
 
         with mock.patch.object(
@@ -639,23 +632,26 @@ class PredictorRegressionTests(unittest.TestCase):
             second_prediction = signal_module.compute_prediction(frame, app_module.DEFAULT_PARAMS)
 
         self.assertEqual(first_prediction["actionState"], "LONG_ACTIVE")
+        self.assertEqual(second_prediction["actionState"], "SHORT_ACTIVE")
+        self.assertEqual(second_prediction["verdict"], "Bearish")
+
+    def test_signal_engine_reverses_short_to_long_immediately(self):
+        frame = self.build_signal_frame()
+
+        with mock.patch.object(
+            signal_module,
+            "calculate_anticipatory_score",
+            side_effect=[
+                (80, "bearish", ["Bearish structure break"]),
+                (80, "bullish", ["Bullish structure break"]),
+            ],
+        ):
+            first_prediction = signal_module.compute_prediction(frame, app_module.DEFAULT_PARAMS)
+            second_prediction = signal_module.compute_prediction(frame, app_module.DEFAULT_PARAMS)
+
+        self.assertEqual(first_prediction["actionState"], "SHORT_ACTIVE")
         self.assertEqual(second_prediction["actionState"], "LONG_ACTIVE")
-        self.assertIn("Cooldown active", second_prediction["antiFlipReason"])
-
-    def test_min_hold_requires_confirmed_opposite_bars(self):
-        params = app_module.DEFAULT_PARAMS
-        signal_state.current_signal = "LONG_ACTIVE"
-        signal_state.current_direction = "bullish"
-        signal_state.last_flip_time = datetime.now(timezone.utc) - timedelta(minutes=16)
-        signal_state.consecutive_opposite_bars = params["min_hold_bars"] - 1
-
-        allowed, reason = signal_state.can_change_signal("SHORT_ACTIVE", "bearish", params)
-        self.assertFalse(allowed)
-        self.assertIn("Opposite signal needs", reason)
-
-        signal_state.consecutive_opposite_bars = params["min_hold_bars"]
-        allowed, reason = signal_state.can_change_signal("SHORT_ACTIVE", "bearish", params)
-        self.assertTrue(allowed)
+        self.assertEqual(second_prediction["verdict"], "Bullish")
 
     def test_refresh_seconds_prefers_new_setting_and_supports_legacy_alias(self):
         with mock.patch.dict(
@@ -883,15 +879,16 @@ class PredictorRegressionTests(unittest.TestCase):
             mocked_push.reset_mock()
 
             def fake_compute(signal_df, params=None):
-                self.assertEqual(signal_df.index[-1], pd.Timestamp("2026-04-30T09:00:00Z"))
+                self.assertEqual(signal_df.index[-1], pd.Timestamp("2026-04-30T08:00:00Z"))
                 self.assertEqual(
                     signal_df.attrs.get("candle_used_for_signal"),
-                    "2026-04-30T09:00:00+00:00",
+                    "2026-04-30T08:00:00+00:00",
                 )
+                self.assertTrue(signal_df.attrs.get("excluded_current_candle"))
                 return self.wait_prediction(
                     score=25,
                     timestamp=fixed_now.isoformat(),
-                    candle_timestamp="2026-04-30T09:00:00+00:00",
+                    candle_timestamp="2026-04-30T08:00:00+00:00",
                 )
 
             with mock.patch.object(app_module, "datetime", self.fixed_datetime(fixed_now)):
@@ -902,7 +899,7 @@ class PredictorRegressionTests(unittest.TestCase):
 
         mocked_push.assert_not_called()
         self.assertEqual(app_module.latest_prediction["actionState"], "SHORT_ACTIVE")
-        self.assertEqual(app_module.latest_prediction["candle_used_for_signal"], "2026-04-30T09:00:00+00:00")
+        self.assertEqual(app_module.latest_prediction["candle_used_for_signal"], "2026-04-30T08:00:00+00:00")
         self.assertTrue(app_module.latest_prediction["grace_period_active"])
         self.assertIn(
             "suppressed_bar_open_instability",
@@ -940,7 +937,7 @@ class PredictorRegressionTests(unittest.TestCase):
         mocked_push.assert_called_once()
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD stop loss hit")
 
-    def test_generate_prediction_uses_current_intrabar_candle_after_grace_window(self):
+    def test_generate_prediction_still_excludes_forming_candle_after_grace_window(self):
         fixed_now = datetime(2026, 4, 30, 9, 20, tzinfo=timezone.utc)
         index = pd.date_range(
             end=pd.Timestamp("2026-04-30T09:00:00Z"),
@@ -956,17 +953,17 @@ class PredictorRegressionTests(unittest.TestCase):
         frame.iloc[-1, frame.columns.get_loc("Volume")] = 10.0
 
         def fake_compute(signal_df, params=None):
-            self.assertEqual(signal_df.index[-1], pd.Timestamp("2026-04-30T09:00:00Z"))
+            self.assertEqual(signal_df.index[-1], pd.Timestamp("2026-04-30T08:00:00Z"))
             self.assertEqual(
                 signal_df.attrs.get("candle_used_for_signal"),
-                "2026-04-30T09:00:00+00:00",
+                "2026-04-30T08:00:00+00:00",
             )
-            self.assertFalse(signal_df.attrs.get("excluded_current_candle"))
+            self.assertTrue(signal_df.attrs.get("excluded_current_candle"))
             self.assertFalse(signal_df.attrs.get("grace_period_active"))
             return self.wait_prediction(
                 score=35,
                 timestamp=fixed_now.isoformat(),
-                candle_timestamp="2026-04-30T09:00:00+00:00",
+                candle_timestamp="2026-04-30T08:00:00+00:00",
             )
 
         with mock.patch.object(app_module, "datetime", self.fixed_datetime(fixed_now)):
@@ -975,8 +972,8 @@ class PredictorRegressionTests(unittest.TestCase):
                     with mock.patch.object(app_module, "compute_prediction", side_effect=fake_compute):
                         app_module.generate_prediction(notify=False)
 
-        self.assertEqual(app_module.latest_prediction["candle_used_for_signal"], "2026-04-30T09:00:00+00:00")
-        self.assertFalse(app_module.latest_prediction["excluded_current_candle"])
+        self.assertEqual(app_module.latest_prediction["candle_used_for_signal"], "2026-04-30T08:00:00+00:00")
+        self.assertTrue(app_module.latest_prediction["excluded_current_candle"])
         self.assertFalse(app_module.latest_prediction["grace_period_active"])
 
     def test_short_stop_loss_triggers_immediately_during_grace_period(self):
@@ -1107,10 +1104,6 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(app_module.last_push_snapshot["score"], 82.0)
         self.assertEqual(app_module.last_push_snapshot["timestamp"], self.iso_at(3))
         self.assertEqual(app_module.last_push_snapshot["signalSnapshotId"], opened_snapshot["signalSnapshotId"])
-        committed_signal = app_module.signal_stabilizer_state[app_module.DEFAULT_SYMBOL]["committed"]
-        self.assertEqual(committed_signal["entryPrice"], opened_risk["entryPrice"])
-        self.assertEqual(committed_signal["stopLoss"], opened_risk["stopLoss"])
-        self.assertEqual(committed_signal["takeProfit"], opened_risk["takeProfit"])
         self.assertEqual(app_module.active_trade_state["entryPrice"], opened_risk["entryPrice"])
         self.assertEqual(app_module.active_trade_state["stopLoss"], opened_risk["stopLoss"])
         self.assertEqual(app_module.active_trade_state["takeProfit"], opened_risk["takeProfit"])
@@ -1244,6 +1237,8 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
 
     def test_signal_notifications_dedupe_same_signal_inside_window(self):
+        app_module.last_push_snapshot = self.wait_snapshot(has_blockers=False)
+
         def prediction(signals, score, confidence=85):
             return {
                 "verdict": "Bullish",
@@ -1267,28 +1262,18 @@ class PredictorRegressionTests(unittest.TestCase):
 
         self.assertEqual(mocked_push.call_count, 1)
 
-    def test_signal_notification_dedupe_survives_process_state_reset(self):
-        snapshot = {
-            **self.wait_snapshot(has_blockers=False),
-            "actionState": "LONG_ACTIVE",
-            "action": "buy",
-            "verdict": "Bullish",
-            "tradeabilityLabel": "Medium",
-            "isActionable": True,
-        }
-        now = datetime(2026, 4, 30, 12, 6, tzinfo=timezone.utc)
+    def test_no_notification_cooldown_blocks_valid_flip_sequence(self):
+        app_module.last_push_snapshot = self.wait_snapshot(has_blockers=False)
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = str(Path(temp_dir) / "notification_state.json")
-            with mock.patch.object(app_module, "WEB_PUSH_NOTIFICATION_STATE_PATH", state_path):
-                self.assertTrue(app_module._should_send_signal_notification(snapshot, now=now))
-                app_module.last_notification = {"key": None, "time": None}
-                self.assertFalse(
-                    app_module._should_send_signal_notification(
-                        snapshot,
-                        now=now + timedelta(minutes=1),
-                    )
-                )
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(1)))
+            app_module._notify_signal_change(self.wait_prediction(score=35, timestamp=self.iso_at(2)))
+            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(3)))
+
+        self.assertEqual(mocked_push.call_count, 3)
+        self.assertEqual(mocked_push.call_args_list[0].args[0], "XAU/USD long signal active")
+        self.assertEqual(mocked_push.call_args_list[1].args[0], "XAU/USD signal paused")
+        self.assertEqual(mocked_push.call_args_list[2].args[0], "XAU/USD long signal active")
 
     def test_active_signal_after_restart_uses_persisted_baseline_without_replay(self):
         active_snapshot = {
@@ -1309,34 +1294,32 @@ class PredictorRegressionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             snapshot_path = str(Path(temp_dir) / "signal_snapshot.json")
-            state_path = str(Path(temp_dir) / "notification_state.json")
             with mock.patch.object(app_module, "WEB_PUSH_SIGNAL_SNAPSHOT_PATH", snapshot_path):
-                with mock.patch.object(app_module, "WEB_PUSH_NOTIFICATION_STATE_PATH", state_path):
-                    app_module._set_notification_snapshot(active_snapshot)
-                    app_module.last_notification_snapshot = None
-                    app_module.last_push_snapshot = None
-                    app_module.signal_stabilizer_state = {}
+                app_module._set_notification_snapshot(active_snapshot)
+                app_module.last_notification_snapshot = None
+                app_module.last_push_snapshot = None
+                app_module.signal_snapshot_state = {}
 
-                    with mock.patch.object(
-                        app_module,
-                        "datetime",
-                        self.fixed_datetime(datetime(2026, 4, 30, 12, 2, tzinfo=timezone.utc)),
-                    ):
-                        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
-                            app_module._notify_signal_change(
-                                self.active_prediction("SHORT_ACTIVE", score=80, timestamp=self.iso_at(101))
-                            )
-                            mocked_push.assert_not_called()
-                            self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
-                            self.assertEqual(
-                                app_module._load_last_notification_snapshot()["actionState"],
-                                "SHORT_ACTIVE",
-                            )
+                with mock.patch.object(
+                    app_module,
+                    "datetime",
+                    self.fixed_datetime(datetime(2026, 4, 30, 12, 2, tzinfo=timezone.utc)),
+                ):
+                    with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+                        app_module._notify_signal_change(
+                            self.active_prediction("SHORT_ACTIVE", score=80, timestamp=self.iso_at(101))
+                        )
+                        mocked_push.assert_not_called()
+                        self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
+                        self.assertEqual(
+                            app_module._load_last_notification_snapshot()["actionState"],
+                            "SHORT_ACTIVE",
+                        )
 
-                            app_module._notify_signal_change(
-                                self.active_prediction("SHORT_ACTIVE", score=80, timestamp=self.iso_at(102))
-                            )
-                            mocked_push.assert_not_called()
+                        app_module._notify_signal_change(
+                            self.active_prediction("SHORT_ACTIVE", score=80, timestamp=self.iso_at(102))
+                        )
+                        mocked_push.assert_not_called()
 
                     persisted_snapshot = app_module._load_last_notification_snapshot()
 
@@ -1362,27 +1345,25 @@ class PredictorRegressionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             snapshot_path = str(Path(temp_dir) / "signal_snapshot.json")
-            state_path = str(Path(temp_dir) / "notification_state.json")
             with mock.patch.object(app_module, "WEB_PUSH_SIGNAL_SNAPSHOT_PATH", snapshot_path):
-                with mock.patch.object(app_module, "WEB_PUSH_NOTIFICATION_STATE_PATH", state_path):
-                    app_module._set_notification_snapshot(active_snapshot)
-                    app_module.last_notification_snapshot = None
-                    app_module.last_push_snapshot = None
-                    app_module.signal_stabilizer_state = {}
+                app_module._set_notification_snapshot(active_snapshot)
+                app_module.last_notification_snapshot = None
+                app_module.last_push_snapshot = None
+                app_module.signal_snapshot_state = {}
 
-                    with mock.patch.object(
-                        app_module,
-                        "datetime",
-                        self.fixed_datetime(datetime(2026, 4, 30, 12, 2, tzinfo=timezone.utc)),
-                    ):
-                        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
-                            app_module._notify_signal_change(
-                                self.wait_prediction(
-                                    score=23.48,
-                                    blockers=["Tradeability 21.1 below threshold 45"],
-                                    timestamp=self.iso_at(101),
-                                )
+                with mock.patch.object(
+                    app_module,
+                    "datetime",
+                    self.fixed_datetime(datetime(2026, 4, 30, 12, 2, tzinfo=timezone.utc)),
+                ):
+                    with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+                        app_module._notify_signal_change(
+                            self.wait_prediction(
+                                score=23.48,
+                                blockers=["Tradeability 21.1 below threshold 45"],
+                                timestamp=self.iso_at(101),
                             )
+                        )
 
         mocked_push.assert_called_once()
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD signal paused")
@@ -1424,7 +1405,7 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(subscriptions[0]["endpoint"], second_subscription["endpoint"])
         self.assertEqual(subscriptions[0]["clientId"], "device-123")
 
-    def test_cooldown_blocked_wait_prediction_does_not_send_active_push(self):
+    def test_blocked_wait_prediction_does_not_send_active_push(self):
         app_module.last_push_snapshot = self.wait_snapshot(score=80.0, has_blockers=False)
         blocked_prediction = {
             "verdict": "Neutral",
@@ -1432,7 +1413,7 @@ class PredictorRegressionTests(unittest.TestCase):
             "action": "hold",
             "actionState": "WAIT",
             "tradeabilityLabel": "High",
-            "blockers": ["Warning: Cooldown active: 4.7min remaining"],
+            "blockers": ["Warning: signal validation blocked active state"],
             "signals": [
                 "Bearish structure break (strength: 1.00)",
                 "VWAP bearish rejection (strength: 1.00)",
@@ -1564,7 +1545,7 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(app_module.last_push_snapshot["verdict"], "Neutral")
         self.assertIn("app status is stale", app_module.last_push_snapshot["blockers"])
 
-    def test_stale_status_blocks_committed_active_dashboard_without_pause_spam(self):
+    def test_stale_status_blocks_active_dashboard_without_pause_spam(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1575,7 +1556,7 @@ class PredictorRegressionTests(unittest.TestCase):
 
             stale_prediction = self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(3))
             stale_prediction["status"] = "stale"
-            dashboard_prediction = app_module._ensure_stabilized_signal_prediction(
+            dashboard_prediction = app_module._ensure_validated_signal_prediction(
                 stale_prediction,
                 status="stale",
                 advance=False,
@@ -1613,7 +1594,7 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(notification_snapshot["score"], 25.0)
         self.assertIn("signal score 25 below threshold 45", dashboard_prediction["blockers"])
 
-    def test_unstable_wait_long_wait_long_does_not_commit_or_spam(self):
+    def test_wait_long_wait_long_flips_immediately(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1621,10 +1602,10 @@ class PredictorRegressionTests(unittest.TestCase):
             app_module._notify_signal_change(self.wait_prediction(score=40, timestamp=self.iso_at(2)))
             app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(3)))
 
-        mocked_push.assert_not_called()
-        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertEqual(mocked_push.call_count, 3)
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
 
-    def test_unstable_wait_short_wait_short_does_not_commit_or_spam(self):
+    def test_wait_short_wait_short_flips_immediately(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1632,10 +1613,10 @@ class PredictorRegressionTests(unittest.TestCase):
             app_module._notify_signal_change(self.wait_prediction(score=40, timestamp=self.iso_at(2)))
             app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(3)))
 
-        mocked_push.assert_not_called()
-        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertEqual(mocked_push.call_count, 3)
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
 
-    def test_stable_long_activation_commits_once(self):
+    def test_immediate_long_activation_notifies_once_until_state_changes(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1647,7 +1628,7 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD long signal active")
         self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
 
-    def test_stable_short_activation_commits_once(self):
+    def test_immediate_short_activation_notifies_once_until_state_changes(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1659,7 +1640,7 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD short signal active")
         self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
 
-    def test_stable_long_pause_commits_once(self):
+    def test_immediate_long_pause_notifies_once_until_state_changes(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1673,7 +1654,7 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD signal paused")
         self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
 
-    def test_stable_short_pause_commits_once(self):
+    def test_immediate_short_pause_notifies_once_until_state_changes(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1687,7 +1668,7 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD signal paused")
         self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
 
-    def test_long_to_short_reversal_requires_confirmation(self):
+    def test_long_to_short_reversal_is_immediate(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1695,14 +1676,12 @@ class PredictorRegressionTests(unittest.TestCase):
             app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(2)))
             mocked_push.reset_mock()
             app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=74, timestamp=self.iso_at(3)))
-            self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
-            app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=74, timestamp=self.iso_at(4)))
 
         self.assertEqual(mocked_push.call_count, 1)
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD short signal active")
         self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
 
-    def test_short_to_long_reversal_requires_confirmation(self):
+    def test_short_to_long_reversal_is_immediate(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1710,14 +1689,12 @@ class PredictorRegressionTests(unittest.TestCase):
             app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(2)))
             mocked_push.reset_mock()
             app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=74, timestamp=self.iso_at(3)))
-            self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
-            app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=74, timestamp=self.iso_at(4)))
 
         self.assertEqual(mocked_push.call_count, 1)
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD long signal active")
         self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
 
-    def test_score_hysteresis_prevents_threshold_chatter(self):
+    def test_no_score_hysteresis_blocks_valid_threshold_flip(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1727,7 +1704,9 @@ class PredictorRegressionTests(unittest.TestCase):
             app_module._notify_signal_change(self.wait_prediction(score=44, blockers=[], timestamp=self.iso_at(3)))
             app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=46, timestamp=self.iso_at(4)))
 
-        mocked_push.assert_not_called()
+        self.assertEqual(mocked_push.call_count, 2)
+        self.assertEqual(mocked_push.call_args_list[0].args[0], "XAU/USD signal paused")
+        self.assertEqual(mocked_push.call_args_list[1].args[0], "XAU/USD long signal active")
         self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
 
     def test_bar_open_grace_suppresses_active_pause_for_both_directions(self):
@@ -1773,7 +1752,7 @@ class PredictorRegressionTests(unittest.TestCase):
                     app_module.last_push_snapshot["suppressionReasons"],
                 )
 
-    def test_grace_expiry_allows_confirmed_signal_pause_after_five_minutes(self):
+    def test_grace_expiry_allows_immediate_signal_pause_after_five_minutes(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1781,20 +1760,19 @@ class PredictorRegressionTests(unittest.TestCase):
             app_module._notify_signal_change(self.active_prediction("SHORT_ACTIVE", score=72, timestamp=self.iso_at(2)))
             mocked_push.reset_mock()
 
-            for offset in (301, 302):
-                weak_prediction = self.wait_prediction(score=25, timestamp=self.iso_at(offset), candle_timestamp=self.iso_at(offset))
-                weak_prediction.update(
-                    {
-                        "signal_snapshot_id": f"post-grace-weak-{offset}",
-                        "calculation_time": self.iso_at(offset),
-                        "latest_provider_candle_time": self.iso_at(offset),
-                        "last_closed_candle_time": self.iso_at(0),
-                        "candle_used_for_signal": self.iso_at(offset),
-                        "candle_is_closed": False,
-                        "grace_period_active": False,
-                    }
-                )
-                app_module._notify_signal_change(weak_prediction)
+            weak_prediction = self.wait_prediction(score=25, timestamp=self.iso_at(301), candle_timestamp=self.iso_at(0))
+            weak_prediction.update(
+                {
+                    "signal_snapshot_id": "post-grace-weak",
+                    "calculation_time": self.iso_at(301),
+                    "latest_provider_candle_time": self.iso_at(301),
+                    "last_closed_candle_time": self.iso_at(0),
+                    "candle_used_for_signal": self.iso_at(0),
+                    "candle_is_closed": True,
+                    "grace_period_active": False,
+                }
+            )
+            app_module._notify_signal_change(weak_prediction)
 
         self.assertEqual(mocked_push.call_count, 1)
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD signal paused")
@@ -1805,19 +1783,19 @@ class PredictorRegressionTests(unittest.TestCase):
 
         def publish_like_scheduler(raw_prediction, offset):
             now = datetime.fromisoformat(self.iso_at(offset))
-            stabilized_prediction = app_module._ensure_stabilized_signal_prediction(
+            validated_prediction = app_module._ensure_validated_signal_prediction(
                 raw_prediction,
                 status="active",
                 now=now,
                 advance=True,
             )
             app_module.latest_prediction = app_module._json_safe(
-                app_module._attach_runtime_state(stabilized_prediction)
+                app_module._attach_runtime_state(validated_prediction)
             )
             app_module.last_update = now
             app_module._notify_signal_change(app_module.latest_prediction)
 
-            dashboard_prediction = app_module._ensure_stabilized_signal_prediction(
+            dashboard_prediction = app_module._ensure_validated_signal_prediction(
                 {
                     **app_module.latest_prediction,
                     "status": "active",
@@ -1831,19 +1809,15 @@ class PredictorRegressionTests(unittest.TestCase):
             return app_module._build_server_signal_snapshot(dashboard_prediction)
 
         def post_grace_weak_prediction(offset):
-            prediction = self.wait_prediction(
-                score=25,
-                timestamp=self.iso_at(offset),
-                candle_timestamp=self.iso_at(offset),
-            )
+            prediction = self.wait_prediction(score=25, timestamp=self.iso_at(offset), candle_timestamp=self.iso_at(0))
             prediction.update(
                 {
                     "signal_snapshot_id": f"post-grace-long-weak-{offset}",
                     "calculation_time": self.iso_at(offset),
                     "latest_provider_candle_time": self.iso_at(offset),
                     "last_closed_candle_time": self.iso_at(0),
-                    "candle_used_for_signal": self.iso_at(offset),
-                    "candle_is_closed": False,
+                    "candle_used_for_signal": self.iso_at(0),
+                    "candle_is_closed": True,
                     "grace_period_active": False,
                 }
             )
@@ -1862,25 +1836,15 @@ class PredictorRegressionTests(unittest.TestCase):
             mocked_push.reset_mock()
 
             first_dashboard_snapshot = publish_like_scheduler(post_grace_weak_prediction(301), 301)
-            mocked_push.assert_not_called()
-            self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
-            self.assertEqual(first_dashboard_snapshot["actionState"], "LONG_ACTIVE")
-            self.assertFalse(app_module.last_push_snapshot["notificationAllowed"])
-            self.assertIn(
-                "waiting for deactivation confirmation",
-                "; ".join(app_module.last_push_snapshot["suppressionReasons"]),
-            )
-
-            second_dashboard_snapshot = publish_like_scheduler(post_grace_weak_prediction(302), 302)
 
         self.assertEqual(mocked_push.call_count, 1)
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD signal paused")
         self.assertIn("Action LONG_ACTIVE -> WAIT", mocked_push.call_args.args[1])
         self.assertIn("New blockers detected", mocked_push.call_args.args[1])
         self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
-        self.assertEqual(second_dashboard_snapshot["actionState"], "WAIT")
-        self.assertEqual(second_dashboard_snapshot["verdict"], "Neutral")
-        self.assertTrue(second_dashboard_snapshot["hasBlockers"])
+        self.assertEqual(first_dashboard_snapshot["actionState"], "WAIT")
+        self.assertEqual(first_dashboard_snapshot["verdict"], "Neutral")
+        self.assertTrue(first_dashboard_snapshot["hasBlockers"])
 
     def test_signal_survives_after_grace_when_score_remains_valid(self):
         app_module.last_push_snapshot = self.wait_snapshot()
@@ -1897,8 +1861,8 @@ class PredictorRegressionTests(unittest.TestCase):
                     "calculation_time": self.iso_at(301),
                     "latest_provider_candle_time": self.iso_at(301),
                     "last_closed_candle_time": self.iso_at(0),
-                    "candle_used_for_signal": self.iso_at(301),
-                    "candle_is_closed": False,
+                    "candle_used_for_signal": self.iso_at(0),
+                    "candle_is_closed": True,
                     "grace_period_active": False,
                 }
             )
@@ -1907,7 +1871,7 @@ class PredictorRegressionTests(unittest.TestCase):
         mocked_push.assert_not_called()
         self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
 
-    def test_intrabar_snapshot_after_grace_can_pause_after_confirmation(self):
+    def test_forming_candle_snapshot_after_grace_cannot_pause_active_trade(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1929,7 +1893,7 @@ class PredictorRegressionTests(unittest.TestCase):
             )
             app_module._notify_signal_change(weak_prediction)
             self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
-            self.assertNotIn("suppressed_incomplete_candle", app_module.last_push_snapshot["suppressionReasons"])
+            self.assertIn("suppressed_incomplete_candle", app_module.last_push_snapshot["suppressionReasons"])
 
             confirmed_weak_prediction = self.wait_prediction(score=25, timestamp=self.iso_at(4), candle_timestamp=self.iso_at(4))
             confirmed_weak_prediction.update(
@@ -1945,11 +1909,10 @@ class PredictorRegressionTests(unittest.TestCase):
             )
             app_module._notify_signal_change(confirmed_weak_prediction)
 
-        self.assertEqual(mocked_push.call_count, 1)
-        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD signal paused")
-        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        mocked_push.assert_not_called()
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
 
-    def test_single_snapshot_blocker_does_not_pause_active_trade(self):
+    def test_single_closed_candle_blocker_pauses_active_trade_immediately(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1958,10 +1921,11 @@ class PredictorRegressionTests(unittest.TestCase):
             mocked_push.reset_mock()
             app_module._notify_signal_change(self.wait_prediction(score=35, blockers=["temporary blocker"], timestamp=self.iso_at(3)))
 
-        mocked_push.assert_not_called()
-        self.assertEqual(app_module.last_push_snapshot["actionState"], "SHORT_ACTIVE")
+        mocked_push.assert_called_once()
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD signal paused")
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
 
-    def test_blockers_cleared_requires_confirmation_window(self):
+    def test_blockers_cleared_with_valid_signal_activates_immediately(self):
         app_module.last_push_snapshot = self.wait_snapshot()
 
         with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
@@ -1970,11 +1934,12 @@ class PredictorRegressionTests(unittest.TestCase):
             mocked_push.reset_mock()
             app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=self.iso_at(3)))
 
-        mocked_push.assert_not_called()
-        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
-        self.assertTrue(app_module.last_push_snapshot["hasBlockers"])
+        mocked_push.assert_called_once()
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD long signal active")
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
+        self.assertFalse(app_module.last_push_snapshot["hasBlockers"])
 
-    def test_duplicate_snapshot_is_ignored_for_confirmation(self):
+    def test_duplicate_snapshot_cannot_replay_notification(self):
         app_module.last_push_snapshot = self.wait_snapshot()
         timestamp = self.iso_at(1)
 
@@ -1982,10 +1947,12 @@ class PredictorRegressionTests(unittest.TestCase):
             app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=timestamp))
             app_module._notify_signal_change(self.active_prediction("LONG_ACTIVE", score=72, timestamp=timestamp))
 
-        mocked_push.assert_not_called()
-        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        mocked_push.assert_called_once()
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD long signal active")
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "LONG_ACTIVE")
+        self.assertFalse(app_module.last_push_snapshot["notificationAllowed"])
 
-    def test_stale_snapshot_is_ignored_for_confirmation(self):
+    def test_stale_snapshot_is_ignored_for_notification(self):
         app_module.last_push_snapshot = self.wait_snapshot()
         stale_timestamp = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
 
