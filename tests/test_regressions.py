@@ -582,6 +582,35 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIn("Breaking key support", signals)
         self.assertGreaterEqual(score, 25)
 
+    def test_opposing_ma_alignment_does_not_strengthen_short_signal(self):
+        frame = self.build_signal_frame().copy()
+        frame["Close"] = 4618.15
+        frame["Open"] = 4619.0
+        frame["High"] = 4621.0
+        frame["Low"] = 4617.0
+        frame["EMA_20"] = 4610.0
+        frame["EMA_50"] = 4605.0
+        frame["VWAP"] = 4625.0
+        frame["ADX_14"] = 24.7
+        frame["VOLUME_SPIKE"] = 0
+        frame["RECENT_SWING_LOW"] = 4620.0
+        frame["RECENT_SWING_HIGH"] = 4635.0
+
+        with mock.patch.object(signal_module, "detect_structure_break", return_value=("none", 0.0)):
+            with mock.patch.object(signal_module, "detect_vwap_rejection", return_value=("bearish_rejection", 1.0)):
+                score, direction, signals = calculate_anticipatory_score(frame, app_module.DEFAULT_PARAMS)
+                prediction = signal_module.compute_prediction(frame, app_module.DEFAULT_PARAMS)
+
+        self.assertEqual(direction, "bearish")
+        self.assertEqual(score, 40)
+        self.assertIn("VWAP bearish rejection (strength: 1.00)", signals)
+        self.assertIn("Conflict: Bullish MA alignment", signals)
+        self.assertIn("Breaking key support", signals)
+        self.assertIn("ADX trending (24.7)", signals)
+        self.assertEqual(prediction["actionState"], "WAIT")
+        self.assertEqual(prediction["verdict"], "Neutral")
+        self.assertIn("Tradeability 36.0 below threshold 45", prediction["blockers"])
+
     def test_signal_engine_flips_long_to_wait_immediately(self):
         frame = self.build_signal_frame()
 

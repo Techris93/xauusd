@@ -227,70 +227,87 @@ def calculate_anticipatory_score(df, params):
     current = df.iloc[-1]
     prev = df.iloc[-2]
 
-    score = 0
-    signals = []
-    direction = "neutral"
+    directional_evidence = []
+    neutral_evidence = []
 
     # 1. Price action at key level (highest weight)
     structure, struct_strength = detect_structure_break(df)
 
     if structure == "bearish_break":
-        score += struct_strength * 35  # Big weight for structure
-        direction = "bearish"
-        signals.append(f"Bearish structure break (strength: {struct_strength:.2f})")
+        directional_evidence.append(
+            ("bearish", struct_strength * 35, f"Bearish structure break (strength: {struct_strength:.2f})")
+        )
     elif structure == "bullish_break":
-        score += struct_strength * 35
-        direction = "bullish"
-        signals.append(f"Bullish structure break (strength: {struct_strength:.2f})")
+        directional_evidence.append(
+            ("bullish", struct_strength * 35, f"Bullish structure break (strength: {struct_strength:.2f})")
+        )
 
     # 2. VWAP rejection (early momentum)
     vwap_signal, vwap_strength = detect_vwap_rejection(df)
-    if vwap_signal == "bearish_rejection" and direction in ["bearish", "neutral"]:
-        score += vwap_strength * 20
-        direction = "bearish"
-        signals.append(f"VWAP bearish rejection (strength: {vwap_strength:.2f})")
-    elif vwap_signal == "bullish_rejection" and direction in ["bullish", "neutral"]:
-        score += vwap_strength * 20
-        direction = "bullish"
-        signals.append(f"VWAP bullish rejection (strength: {vwap_strength:.2f})")
+    if vwap_signal == "bearish_rejection":
+        directional_evidence.append(
+            ("bearish", vwap_strength * 20, f"VWAP bearish rejection (strength: {vwap_strength:.2f})")
+        )
+    elif vwap_signal == "bullish_rejection":
+        directional_evidence.append(
+            ("bullish", vwap_strength * 20, f"VWAP bullish rejection (strength: {vwap_strength:.2f})")
+        )
 
     # 3. MA alignment (trend confirmation)
     ema20 = current.get('EMA_20')
     ema50 = current.get('EMA_50')
     if pd.notna(ema20) and pd.notna(ema50):
         if current['Close'] < ema20 < ema50:
-            score += 15
-            if direction == "neutral":
-                direction = "bearish"
-            signals.append("Bearish MA alignment")
+            directional_evidence.append(("bearish", 15, "Bearish MA alignment"))
         elif current['Close'] > ema20 > ema50:
-            score += 15
-            if direction == "neutral":
-                direction = "bullish"
-            signals.append("Bullish MA alignment")
+            directional_evidence.append(("bullish", 15, "Bullish MA alignment"))
 
-    # 4. ADX momentum (but don't require high threshold)
-    adx = current.get('ADX_14', 0)
-    if adx >= params['adx_threshold']:
-        score += 10
-        signals.append(f"ADX trending ({adx:.1f})")
-    elif adx >= 15:  # Even weak trend gets some points
-        score += 5
-        signals.append(f"ADX weak trend ({adx:.1f})")
-
-    # 5. Volume confirmation
-    if 'VOLUME_SPIKE' in current and current['VOLUME_SPIKE']:
-        score += 10
-        signals.append("Volume spike")
-
-    # 6. Support/Resistance break
+    # 4. Support/Resistance break
     sr_break = detect_support_resistance_break(current, prev)
-    if direction == "bearish" and sr_break == "support":
-        score += 10
-        signals.append("Breaking key support")
-    elif direction == "bullish" and sr_break == "resistance":
-        score += 10
-        signals.append("Breaking key resistance")
+    if sr_break == "support":
+        directional_evidence.append(("bearish", 10, "Breaking key support"))
+    elif sr_break == "resistance":
+        directional_evidence.append(("bullish", 10, "Breaking key resistance"))
+
+    bullish_score = sum(points for side, points, _ in directional_evidence if side == "bullish")
+    bearish_score = sum(points for side, points, _ in directional_evidence if side == "bearish")
+    score_gap = abs(bullish_score - bearish_score)
+    direction_threshold = params.get("direction_threshold", 1.0)
+
+    if bullish_score <= 0 and bearish_score <= 0:
+        direction = "neutral"
+    elif score_gap < direction_threshold:
+        direction = "neutral"
+    elif bullish_score > bearish_score:
+        direction = "bullish"
+    else:
+        direction = "bearish"
+
+    score = bullish_score if direction == "bullish" else bearish_score if direction == "bearish" else max(bullish_score, bearish_score)
+
+    # 5. ADX momentum confirms the selected side only; it should not turn
+    # opposing evidence into extra points for the winning direction.
+    adx = current.get('ADX_14', 0)
+    if direction != "neutral":
+        if adx >= params['adx_threshold']:
+            score += 10
+            neutral_evidence.append(f"ADX trending ({adx:.1f})")
+        elif adx >= 15:
+            score += 5
+            neutral_evidence.append(f"ADX weak trend ({adx:.1f})")
+
+        # 6. Volume confirmation also confirms only the selected side.
+        if 'VOLUME_SPIKE' in current and current['VOLUME_SPIKE']:
+            score += 10
+            neutral_evidence.append("Volume spike")
+
+    signals = []
+    for side, _, text in directional_evidence:
+        if direction != "neutral" and side != direction:
+            signals.append(f"Conflict: {text}")
+        else:
+            signals.append(text)
+    signals.extend(neutral_evidence)
 
     return min(score, 100), direction, signals
 
