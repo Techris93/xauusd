@@ -38,13 +38,7 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.last_notification_snapshot = None
         app_module.signal_snapshot_state = {}
         app_module.active_trade_state = None
-        app_module.risk_state = {
-            "slHit": False,
-            "tpHit": False,
-            "exitReason": None,
-            "exitPrice": None,
-            "exitTime": None,
-        }
+        app_module.risk_state = app_module._empty_risk_state()
         app_module.bar_state = {}
         app_module.get_web_push_config.cache_clear()
         Path(app_module.WEB_PUSH_SIGNAL_SNAPSHOT_PATH).unlink(missing_ok=True)
@@ -60,13 +54,7 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.last_notification_snapshot = None
         app_module.signal_snapshot_state = {}
         app_module.active_trade_state = None
-        app_module.risk_state = {
-            "slHit": False,
-            "tpHit": False,
-            "exitReason": None,
-            "exitPrice": None,
-            "exitTime": None,
-        }
+        app_module.risk_state = app_module._empty_risk_state()
         app_module.bar_state = {}
         app_module.get_web_push_config.cache_clear()
         Path(app_module.WEB_PUSH_SIGNAL_SNAPSHOT_PATH).unlink(missing_ok=True)
@@ -172,6 +160,35 @@ class PredictorRegressionTests(unittest.TestCase):
             "lastUpdate": timestamp,
             "chartData": {"timestamps": [candle_timestamp]},
         }
+
+    def active_prediction_for_closed_candle(
+        self,
+        action_state="LONG_ACTIVE",
+        score=78,
+        timestamp_offset=1,
+        candle_offset=0,
+        snapshot_suffix=None,
+    ):
+        timestamp = self.iso_at(timestamp_offset)
+        candle_timestamp = self.iso_at(candle_offset)
+        prediction = self.active_prediction(
+            action_state=action_state,
+            score=score,
+            timestamp=timestamp,
+            candle_timestamp=candle_timestamp,
+        )
+        prediction.update(
+            {
+                "signal_snapshot_id": f"{action_state}|{snapshot_suffix or timestamp}",
+                "calculation_time": timestamp,
+                "latest_provider_candle_time": candle_timestamp,
+                "last_closed_candle_time": candle_timestamp,
+                "candle_used_for_signal": candle_timestamp,
+                "candle_is_closed": True,
+                "grace_period_active": False,
+            }
+        )
+        return prediction
 
     @staticmethod
     def wait_prediction(score=35, blockers=None, timestamp=None, candle_timestamp=None):
@@ -1098,6 +1115,132 @@ class PredictorRegressionTests(unittest.TestCase):
         mocked_compute.assert_not_called()
         mocked_push.assert_called_once()
         self.assertEqual(app_module.risk_state["exitReason"], "SL_HIT")
+
+    def test_same_closed_candle_signal_does_not_rearm_after_stop_loss(self):
+        app_module.last_push_snapshot = self.wait_snapshot(has_blockers=False)
+        first_signal = self.active_prediction_for_closed_candle(
+            "LONG_ACTIVE",
+            score=78,
+            timestamp_offset=1,
+            candle_offset=0,
+            snapshot_suffix="first-refresh",
+        )
+        repeated_signal = self.active_prediction_for_closed_candle(
+            "LONG_ACTIVE",
+            score=78,
+            timestamp_offset=20,
+            candle_offset=0,
+            snapshot_suffix="later-refresh-same-candle",
+        )
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(first_signal)
+            self.assertEqual(app_module.active_trade_state["action"], "LONG_ACTIVE")
+            triggered = app_module._process_live_price_tick(2396.9, self.timestamp_base + timedelta(seconds=10))
+            self.assertTrue(triggered)
+            self.assertIsNone(app_module.active_trade_state)
+            self.assertEqual(app_module.risk_state["exitReason"], "SL_HIT")
+            self.assertIsNotNone(app_module.risk_state["closedSignalKey"])
+
+            app_module._notify_signal_change(repeated_signal)
+
+        self.assertEqual(mocked_push.call_count, 2)
+        self.assertEqual(mocked_push.call_args_list[0].args[0], "XAU/USD long signal active")
+        self.assertEqual(mocked_push.call_args_list[1].args[0], "XAU/USD stop loss hit")
+        self.assertIsNone(app_module.active_trade_state)
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertFalse(app_module.last_push_snapshot["notificationAllowed"])
+        self.assertIn(
+            "closed signal already exited: SL_HIT",
+            app_module.last_push_snapshot["blockers"],
+        )
+
+    def test_same_closed_candle_short_signal_does_not_rearm_after_take_profit(self):
+        app_module.last_push_snapshot = self.wait_snapshot(has_blockers=False)
+        first_signal = self.active_prediction_for_closed_candle(
+            "SHORT_ACTIVE",
+            score=78,
+            timestamp_offset=1,
+            candle_offset=0,
+            snapshot_suffix="first-refresh",
+        )
+        repeated_signal = self.active_prediction_for_closed_candle(
+            "SHORT_ACTIVE",
+            score=78,
+            timestamp_offset=20,
+            candle_offset=0,
+            snapshot_suffix="later-refresh-same-candle",
+        )
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(first_signal)
+            triggered = app_module._process_live_price_tick(2393.9, self.timestamp_base + timedelta(seconds=10))
+            self.assertTrue(triggered)
+            self.assertEqual(app_module.risk_state["exitReason"], "TP_HIT")
+
+            app_module._notify_signal_change(repeated_signal)
+
+        self.assertEqual(mocked_push.call_count, 2)
+        self.assertEqual(mocked_push.call_args_list[0].args[0], "XAU/USD short signal active")
+        self.assertEqual(mocked_push.call_args_list[1].args[0], "XAU/USD take profit hit")
+        self.assertIsNone(app_module.active_trade_state)
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertIn(
+            "closed signal already exited: TP_HIT",
+            app_module.last_push_snapshot["blockers"],
+        )
+
+    def test_new_closed_candle_signal_can_arm_after_prior_stop_loss(self):
+        app_module.last_push_snapshot = self.wait_snapshot(has_blockers=False)
+        first_signal = self.active_prediction_for_closed_candle(
+            "LONG_ACTIVE",
+            score=78,
+            timestamp_offset=1,
+            candle_offset=0,
+            snapshot_suffix="first-refresh",
+        )
+        next_candle_signal = self.active_prediction_for_closed_candle(
+            "LONG_ACTIVE",
+            score=78,
+            timestamp_offset=120,
+            candle_offset=60,
+            snapshot_suffix="new-closed-candle",
+        )
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(first_signal)
+            app_module._process_live_price_tick(2396.9, self.timestamp_base + timedelta(seconds=10))
+            mocked_push.reset_mock()
+
+            app_module._notify_signal_change(next_candle_signal)
+
+        mocked_push.assert_called_once()
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD long signal active")
+        self.assertIsNotNone(app_module.active_trade_state)
+        self.assertEqual(app_module.active_trade_state["action"], "LONG_ACTIVE")
+        self.assertNotEqual(
+            app_module.active_trade_state["signalIdentityKey"],
+            app_module.risk_state.get("closedSignalKey"),
+        )
+
+    def test_repeated_price_tick_after_stop_loss_is_idempotent(self):
+        app_module.last_push_snapshot = self.wait_snapshot(has_blockers=False)
+        first_signal = self.active_prediction_for_closed_candle(
+            "LONG_ACTIVE",
+            score=78,
+            timestamp_offset=1,
+            candle_offset=0,
+        )
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(first_signal)
+            first_exit = app_module._process_live_price_tick(2396.9, self.timestamp_base + timedelta(seconds=10))
+            second_exit = app_module._process_live_price_tick(2396.8, self.timestamp_base + timedelta(seconds=11))
+
+        self.assertTrue(first_exit)
+        self.assertFalse(second_exit)
+        self.assertEqual(mocked_push.call_count, 2)
+        self.assertEqual(mocked_push.call_args_list[1].args[0], "XAU/USD stop loss hit")
 
     def test_same_active_signal_does_not_move_open_trade_risk_levels(self):
         with mock.patch.object(app_module, "_send_web_push_notification"):

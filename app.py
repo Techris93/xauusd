@@ -140,6 +140,23 @@ MAX_OHLC_RANGE_RATIO = 0.20
 BAR_OPEN_GRACE_SECONDS = _read_bar_open_grace_seconds()
 SIGNAL_SCORE_THRESHOLD = float(DEFAULT_PARAMS.get("min_tradeability", 45))
 
+
+def _empty_risk_state(**overrides):
+    state = {
+        "slHit": False,
+        "tpHit": False,
+        "exitReason": None,
+        "exitPrice": None,
+        "exitTime": None,
+        "closedSignalKey": None,
+        "closedSignalAction": None,
+        "closedSignalCandle": None,
+        "closedSignalSnapshotId": None,
+    }
+    state.update(overrides)
+    return state
+
+
 latest_prediction = None
 last_update = None
 last_price_update = None
@@ -148,13 +165,7 @@ last_push_snapshot = None
 last_notification_snapshot = None
 signal_snapshot_state = {}
 active_trade_state = None
-risk_state = {
-    "slHit": False,
-    "tpHit": False,
-    "exitReason": None,
-    "exitPrice": None,
-    "exitTime": None,
-}
+risk_state = _empty_risk_state()
 bar_state = {}
 prediction_refresh_lock = threading.RLock()
 push_lock = threading.Lock()
@@ -448,6 +459,68 @@ def _format_signal_number(value):
     if number is None:
         return "--"
     return str(int(number)) if number.is_integer() else f"{number:.1f}"
+
+
+def _identity_number(value):
+    number = _finite_float(value)
+    if number is None:
+        return ""
+    return f"{number:.4f}"
+
+
+def _signal_candle_identity(signal):
+    return (
+        signal.get("candle_used_for_signal")
+        or signal.get("candleUsedForSignal")
+        or signal.get("last_closed_candle_time")
+        or signal.get("lastClosedCandleTime")
+        or signal.get("candleTimestamp")
+        or signal.get("signalsKey")
+        or ""
+    )
+
+
+def _active_signal_identity_key(signal):
+    if not isinstance(signal, dict):
+        return None
+    action_state = signal.get("actionState") or signal.get("action")
+    if action_state not in ACTIVE_ACTION_STATES:
+        return None
+
+    entry_price = signal.get("entryPrice")
+    if entry_price is None:
+        entry_price = signal.get("signalPrice")
+    stop_loss = signal.get("stopLoss")
+    take_profit = signal.get("takeProfit")
+    if (
+        _finite_float(entry_price) is None
+        or _finite_float(stop_loss) is None
+        or _finite_float(take_profit) is None
+    ):
+        return None
+
+    return "|".join(
+        [
+            str(signal.get("symbol") or DEFAULT_SYMBOL),
+            str(action_state),
+            str(_signal_candle_identity(signal)),
+            _identity_number(entry_price),
+            _identity_number(stop_loss),
+            _identity_number(take_profit),
+        ]
+    )
+
+
+def _closed_signal_exit_reason(signal):
+    signal_key = _active_signal_identity_key(signal)
+    if not signal_key:
+        return None
+    with risk_lock:
+        closed_signal_key = risk_state.get("closedSignalKey")
+        exit_reason = risk_state.get("exitReason")
+    if signal_key and closed_signal_key and signal_key == closed_signal_key:
+        return f"closed signal already exited: {exit_reason or 'risk exit'}"
+    return None
 
 
 def _prediction_score(prediction):
@@ -893,6 +966,12 @@ def _resolve_signal_snapshot(prediction, now=None, advance=True):
                 reason = "suppressed_bar_open_instability"
                 signal = preserved_signal
                 notification_allowed = False
+        elif candidate["actionState"] in ACTIVE_ACTION_STATES:
+            closed_exit_reason = _closed_signal_exit_reason(candidate)
+            if closed_exit_reason:
+                reason = closed_exit_reason
+                signal = _blocked_wait_fields(candidate, reason)
+                notification_allowed = False
 
         if advance and (snapshot_timestamp is not None) and reason != "duplicate or out-of-order snapshot ignored":
             state["lastSnapshotTimestamp"] = snapshot_timestamp
@@ -1268,9 +1347,12 @@ def _active_signal_from_prediction(prediction, now=None):
         or prediction.get("lastUpdate")
         or (now or datetime.now(timezone.utc)).isoformat()
     )
+    signals = prediction.get("signals") if isinstance(prediction.get("signals"), list) else []
     is_long = action_state == "LONG_ACTIVE"
-    return {
+    active_signal = {
+        "symbol": _prediction_symbol(prediction),
         "direction": "LONG" if is_long else "SHORT",
+        "actionState": action_state,
         "action": action_state,
         "entryPrice": signal_price,
         "stopLoss": stop_loss,
@@ -1280,12 +1362,19 @@ def _active_signal_from_prediction(prediction, now=None):
         "rrRatio": prediction.get("rrRatio"),
         "signalPrice": signal_price,
         "createdAt": created_at,
+        "signalsKey": "|".join(_normalize_signal_text(signal) for signal in signals[:4]),
         "lastConfirmedScore": validation.get("score") or _prediction_score(prediction),
         "lastConfirmedConfidence": prediction.get("confidence"),
         "lastConfirmedTradeability": validation.get("tradeabilityLabel")
         or prediction.get("tradeabilityLabel"),
+        "signalSnapshotId": validation.get("signalSnapshotId") or prediction.get("signal_snapshot_id"),
+        "candleUsedForSignal": validation.get("candleUsedForSignal") or prediction.get("candle_used_for_signal"),
+        "lastClosedCandleTime": validation.get("lastClosedCandleTime") or prediction.get("last_closed_candle_time"),
+        "calculationTime": validation.get("calculationTime") or prediction.get("calculation_time"),
         "status": "OPEN",
     }
+    active_signal["signalIdentityKey"] = _active_signal_identity_key(active_signal)
+    return active_signal
 
 
 def _sync_active_trade_state(prediction, now=None):
@@ -1299,6 +1388,18 @@ def _sync_active_trade_state(prediction, now=None):
                 active_trade_state = None
             return None
 
+        next_signal_key = next_active_signal.get("signalIdentityKey") or _active_signal_identity_key(next_active_signal)
+        if next_signal_key and next_signal_key == risk_state.get("closedSignalKey"):
+            logger.info(
+                "Suppressing re-arm of closed signal symbol=%s action=%s candle=%s reason=%s",
+                next_active_signal.get("symbol") or DEFAULT_SYMBOL,
+                next_active_signal.get("action"),
+                next_active_signal.get("candleUsedForSignal"),
+                risk_state.get("exitReason"),
+            )
+            active_trade_state = None
+            return None
+
         if (
             active_trade_state
             and active_trade_state.get("status") == "OPEN"
@@ -1310,6 +1411,8 @@ def _sync_active_trade_state(prediction, now=None):
                     "lastConfirmedScore": next_active_signal.get("lastConfirmedScore"),
                     "lastConfirmedConfidence": next_active_signal.get("lastConfirmedConfidence"),
                     "lastConfirmedTradeability": next_active_signal.get("lastConfirmedTradeability"),
+                    "signalSnapshotId": next_active_signal.get("signalSnapshotId"),
+                    "calculationTime": next_active_signal.get("calculationTime"),
                     "status": "OPEN",
                 }
             )
@@ -1317,13 +1420,7 @@ def _sync_active_trade_state(prediction, now=None):
             return dict(active_trade_state)
 
         active_trade_state = next_active_signal
-        risk_state = {
-            "slHit": False,
-            "tpHit": False,
-            "exitReason": None,
-            "exitPrice": None,
-            "exitTime": None,
-        }
+        risk_state = _empty_risk_state()
         return dict(active_trade_state)
 
 
@@ -1409,14 +1506,21 @@ def _commit_risk_exit(active_signal, current_price, reason, timestamp, notify=Tr
         if active_trade_state is None:
             return False
 
-        risk_state = {
-            "slHit": reason == "SL_HIT",
-            "tpHit": reason == "TP_HIT",
-            "exitReason": reason,
-            "exitPrice": round(current_price, 2),
-            "exitTime": timestamp.isoformat(),
-        }
         closed_active_signal = dict(active_signal)
+        closed_signal_key = closed_active_signal.get("signalIdentityKey") or _active_signal_identity_key(closed_active_signal)
+        closed_active_signal["signalIdentityKey"] = closed_signal_key
+        risk_state = _empty_risk_state(
+            slHit=reason == "SL_HIT",
+            tpHit=reason == "TP_HIT",
+            exitReason=reason,
+            exitPrice=round(current_price, 2),
+            exitTime=timestamp.isoformat(),
+            closedSignalKey=closed_signal_key,
+            closedSignalAction=closed_active_signal.get("action"),
+            closedSignalCandle=closed_active_signal.get("candleUsedForSignal")
+            or closed_active_signal.get("lastClosedCandleTime"),
+            closedSignalSnapshotId=closed_active_signal.get("signalSnapshotId"),
+        )
         closed_active_signal.update(
             {
                 "status": "CLOSED",
