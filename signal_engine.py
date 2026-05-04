@@ -59,7 +59,6 @@ SIGNAL_METADATA_FIELDS = (
     "last_closed_candle_time",
     "candle_used_for_signal",
     "candle_is_closed",
-    "grace_period_active",
 )
 
 

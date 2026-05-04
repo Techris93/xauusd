@@ -269,18 +269,6 @@
         color: #6b7280;
         margin-top: 4px;
       }
-      .bar-grace-status {
-        margin: -8px 0 20px;
-        padding: 12px 16px;
-        border: 1px solid rgba(255, 215, 0, 0.24);
-        border-radius: 10px;
-        background: rgba(255, 215, 0, 0.08);
-        color: #f8d76b;
-        font-size: 13px;
-        font-weight: 700;
-        text-align: center;
-      }
-
       /* Chart Container */
       .chart-container {
         position: relative;
@@ -556,8 +544,6 @@
             <div class="price-label">Price Update</div>
           </div>
         </div>
-        <div id="barGraceStatus" class="bar-grace-status" style="display: none"></div>
-
         <div class="grid">
           <!-- Verdict Card -->
           <div class="card">
@@ -780,10 +766,22 @@
           signalsKey: normalizedSignals.join("|"),
           blockers: blockers,
           hasBlockers: blockers.length > 0,
+          memoryActive: Boolean(validation.memoryActive || data.memoryActive),
+          memoryReason: validation.memoryReason || data.memoryReason || null,
+          exitReason: validation.exitReason || data.exitReason || null,
         };
       }
 
       function buildAlertTitle(previous, current) {
+        if (current.exitReason === "STOP_LOSS_HIT") {
+          return "XAU/USD stop loss hit";
+        }
+        if (current.exitReason === "TAKE_PROFIT_HIT") {
+          return "XAU/USD take profit hit";
+        }
+        if (current.exitReason) {
+          return "XAU/USD signal exited";
+        }
         if (
           previous.actionState !== current.actionState &&
           isActionableState(current.actionState)
@@ -816,6 +814,9 @@
           severity = isActionableState(current.actionState)
             ? "success"
             : "warn";
+        }
+        if (current.exitReason) {
+          changes.push(`Exit reason: ${current.exitReason}`);
         }
         if (previous.verdict !== current.verdict) {
           changes.push(`Bias ${previous.verdict} -> ${current.verdict}`);
@@ -1438,48 +1439,6 @@
           tradeBtn.textContent = "Waiting for Signal...";
           tradeBtn.className = "trade-btn";
           tradeBtn.disabled = true;
-        }
-
-        const graceStatus = document.getElementById("barGraceStatus");
-        const barState =
-          data.barState && typeof data.barState === "object"
-            ? data.barState
-            : {};
-        const validation =
-          data.signalValidation && typeof data.signalValidation === "object"
-            ? data.signalValidation
-            : {};
-        const graceActive = Boolean(
-          barState.gracePeriodActive ||
-            validation.gracePeriodActive ||
-            validation.candidateGracePeriodActive ||
-            data.grace_period_active,
-        );
-        if (graceStatus && tradeIsActive && graceActive) {
-          let remainingSeconds = Number(barState.graceRemainingSeconds);
-          const currentBarTime = Date.parse(barState.currentBarTime || "");
-          const gracePeriodSeconds = Number(barState.gracePeriodSeconds || 300);
-          if (
-            Number.isFinite(currentBarTime) &&
-            Number.isFinite(gracePeriodSeconds)
-          ) {
-            remainingSeconds = Math.max(
-              0,
-              gracePeriodSeconds - Math.floor((Date.now() - currentBarTime) / 1000),
-            );
-          }
-          if (!Number.isFinite(remainingSeconds)) {
-            remainingSeconds = gracePeriodSeconds;
-          }
-          const remainingMinutes = Math.max(
-            1,
-            Math.ceil(remainingSeconds / 60),
-          );
-          graceStatus.style.display = "block";
-          graceStatus.textContent = `New bar grace period active: ${remainingMinutes} min remaining`;
-        } else if (graceStatus) {
-          graceStatus.style.display = "none";
-          graceStatus.textContent = "";
         }
 
         if (data.chartData) {

@@ -52,17 +52,6 @@ def _read_prediction_refresh_seconds():
         return 5
 
 
-def _read_bar_open_grace_seconds():
-    raw_value = os.getenv("SIGNAL_BAR_OPEN_GRACE_SECONDS", "300").strip()
-    try:
-        return max(0, int(raw_value))
-    except ValueError:
-        logger.warning(
-            "Invalid bar-open grace period %r; defaulting to 300 seconds.",
-            raw_value,
-        )
-        return 300
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
@@ -90,6 +79,30 @@ def _web_push_subject():
         "VAPID_CLAIMS_SUBJECT",
         default="mailto:notifications@xauusd.local",
     )
+
+
+def _read_float_env(name, default):
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return float(default)
+    try:
+        return float(raw_value)
+    except ValueError:
+        logger.warning("Invalid %s %r; defaulting to %s.", name, raw_value, default)
+        return float(default)
+
+
+def _read_positive_int_env(name, default):
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return int(default)
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        logger.warning("Invalid %s %r; defaulting to %s.", name, raw_value, default)
+        return int(default)
+    return parsed if parsed > 0 else int(default)
+
 
 TD_OUTPUT_TIMEZONE = "UTC"
 DEFAULT_SYMBOL = os.getenv("TWELVE_DATA_SYMBOL", "XAU/USD").strip() or "XAU/USD"
@@ -132,16 +145,16 @@ SIGNAL_SNAPSHOT_METADATA_FIELDS = (
     "last_closed_candle_time",
     "candle_used_for_signal",
     "candle_is_closed",
-    "grace_period_active",
     "excluded_empty_closed_candle_count",
 )
 SIGNAL_PUSH_PAYLOAD_VERSION = "authoritative-signal-v2"
 SIGNAL_PUSH_MAX_AGE_SECONDS = 300
 MAX_OHLC_RANGE_RATIO = 0.20
-BAR_OPEN_GRACE_SECONDS = _read_bar_open_grace_seconds()
 SIGNAL_SCORE_THRESHOLD = float(
     DEFAULT_PARAMS.get("min_signal_score", DEFAULT_PARAMS.get("min_tradeability", 45))
 )
+SIGNAL_MEMORY_STRONG_REVERSAL_SCORE = _read_float_env("SIGNAL_MEMORY_STRONG_REVERSAL_SCORE", 60)
+SIGNAL_MEMORY_WEAK_CONTINUATION_BARS = _read_positive_int_env("SIGNAL_MEMORY_WEAK_CONTINUATION_BARS", 2)
 
 
 def _empty_risk_state(**overrides):
@@ -152,6 +165,7 @@ def _empty_risk_state(**overrides):
         "exitPrice": None,
         "exitTime": None,
         "closedSignalKey": None,
+        "closedSignalBaseKey": None,
         "closedSignalAction": None,
         "closedSignalCandle": None,
         "closedSignalSnapshotId": None,
@@ -564,6 +578,183 @@ def _valid_signal_risk(action_state, signal_price, stop_loss, take_profit):
     return False
 
 
+def _normalize_signal_direction(value):
+    text = str(value or "").strip().lower()
+    if text in {"bullish", "bull", "long", "buy", "long_active"}:
+        return "bullish"
+    if text in {"bearish", "bear", "short", "sell", "short_active"}:
+        return "bearish"
+    return "neutral"
+
+
+class SignalMemory:
+    """Stateful active-signal memory; exits stay immediate, weak-bar noise does not."""
+
+    def __init__(self, strong_reversal_score=60, weak_continuation_bars=2):
+        self.strong_reversal_score = float(strong_reversal_score)
+        self.weak_continuation_bars = max(1, int(weak_continuation_bars))
+
+    def commit(self, signal, now=None):
+        if not isinstance(signal, dict):
+            return None
+        action_state = signal.get("actionState") or signal.get("action")
+        if action_state not in ACTIVE_ACTION_STATES:
+            return None
+
+        entry_price = _finite_float(signal.get("entryPrice") or signal.get("signalPrice"))
+        stop_loss = _finite_float(signal.get("stopLoss"))
+        take_profit = _finite_float(signal.get("takeProfit"))
+        if (
+            entry_price is None
+            or stop_loss is None
+            or take_profit is None
+            or not _valid_signal_risk(action_state, entry_price, stop_loss, take_profit)
+        ):
+            return None
+
+        now_iso = _coerce_utc_datetime(now or datetime.now(timezone.utc)).isoformat()
+        is_long = action_state == "LONG_ACTIVE"
+        committed = dict(signal)
+        committed.update(
+            {
+                "direction": "LONG" if is_long else "SHORT",
+                "action": action_state,
+                "actionState": action_state,
+                "entryPrice": entry_price,
+                "signalPrice": entry_price,
+                "stopLoss": stop_loss,
+                "takeProfit": take_profit,
+                "entryScore": _finite_float(signal.get("lastConfirmedScore") or signal.get("score")) or 0.0,
+                "barsHeld": int(signal.get("barsHeld") or 0),
+                "weakContinuationBars": int(signal.get("weakContinuationBars") or 0),
+                "entrySnapshotId": signal.get("signalSnapshotId") or signal.get("signal_snapshot_id"),
+                "entryCandleTime": signal.get("candleUsedForSignal") or signal.get("candle_used_for_signal"),
+                "lastEvaluatedCandleTime": signal.get("candleUsedForSignal") or signal.get("candle_used_for_signal"),
+                "lastUpdateTime": now_iso,
+                "lastExitReason": None,
+                "memoryActive": True,
+                "memoryReason": "COMMITTED",
+                "exitReason": None,
+                "status": "OPEN",
+            }
+        )
+        committed["signalIdentityKey"] = _active_signal_identity_key(committed)
+        committed["signalBaseIdentityKey"] = _active_signal_base_identity_key(committed)
+        return committed
+
+    def can_exit(self, active_signal, candidate, now=None):
+        if not isinstance(active_signal, dict) or active_signal.get("status") != "OPEN":
+            return None, active_signal
+
+        updated = dict(active_signal)
+        current_price = _finite_float(candidate.get("currentPrice"))
+        risk_reason = _risk_exit_for_price(updated, current_price)
+        if risk_reason == "SL_HIT":
+            return "STOP_LOSS_HIT", updated
+        if risk_reason == "TP_HIT":
+            return "TAKE_PROFIT_HIT", updated
+
+        active_direction = "bullish" if updated.get("direction") == "LONG" else "bearish"
+        opposite_direction = "bearish" if active_direction == "bullish" else "bullish"
+        current_direction = _normalize_signal_direction(candidate.get("rawDirection") or candidate.get("direction"))
+        current_score = _finite_float(candidate.get("score")) or 0.0
+
+        if current_direction == opposite_direction and current_score >= self.strong_reversal_score:
+            return "STRONG_REVERSAL", updated
+
+        current_candle = (
+            candidate.get("candle_used_for_signal")
+            or candidate.get("latest_provider_candle_time")
+            or candidate.get("last_closed_candle_time")
+            or candidate.get("timestamp")
+        )
+        last_evaluated_candle = updated.get("lastEvaluatedCandleTime")
+        if current_candle and current_candle != last_evaluated_candle:
+            updated["barsHeld"] = int(updated.get("barsHeld") or 0) + 1
+            updated["lastEvaluatedCandleTime"] = current_candle
+            if current_direction != active_direction:
+                updated["weakContinuationBars"] = int(updated.get("weakContinuationBars") or 0) + 1
+            else:
+                updated["weakContinuationBars"] = 0
+
+        if int(updated.get("weakContinuationBars") or 0) >= self.weak_continuation_bars:
+            return "WEAK_CONTINUATION", updated
+
+        if current_direction == active_direction and current_score > (_finite_float(updated.get("lastConfirmedScore")) or 0.0):
+            updated["lastConfirmedScore"] = current_score
+            updated["lastConfirmedConfidence"] = candidate.get("confidence") or updated.get("lastConfirmedConfidence")
+            updated["lastConfirmedTradeability"] = candidate.get("tradeabilityLabel") or updated.get("lastConfirmedTradeability")
+
+        updated["lastUpdateTime"] = _coerce_utc_datetime(now or datetime.now(timezone.utc)).isoformat()
+        updated["memoryActive"] = True
+        updated["memoryReason"] = "HOLDING"
+        updated["exitReason"] = None
+        return None, updated
+
+    def clear(self, active_signal, reason, current_price=None, now=None):
+        if not isinstance(active_signal, dict):
+            return None
+        cleared = dict(active_signal)
+        cleared.update(
+            {
+                "status": "CLOSED",
+                "memoryActive": False,
+                "lastExitReason": reason,
+                "exitReason": reason,
+                "exitPrice": round(current_price, 2) if _finite_float(current_price) is not None else None,
+                "exitTime": _coerce_utc_datetime(now or datetime.now(timezone.utc)).isoformat(),
+            }
+        )
+        return cleared
+
+    def to_active_prediction(self, base_prediction, active_signal, reason="HOLDING"):
+        if not isinstance(active_signal, dict):
+            return dict(base_prediction)
+        action_state = active_signal.get("action")
+        is_long = action_state == "LONG_ACTIVE"
+        signal = dict(base_prediction)
+        signal.update(
+            {
+                "actionState": action_state,
+                "direction": "bullish" if is_long else "bearish",
+                "action": "buy" if is_long else "sell",
+                "verdict": "Bullish" if is_long else "Bearish",
+                "tradeabilityLabel": active_signal.get("lastConfirmedTradeability")
+                or signal.get("tradeabilityLabel")
+                or "Medium",
+                "confidence": _finite_float(active_signal.get("lastConfirmedConfidence"))
+                or signal.get("confidence")
+                or 50.0,
+                "score": _finite_float(active_signal.get("lastConfirmedScore"))
+                or signal.get("score")
+                or 0.0,
+                "blockers": [],
+                "activeTrade": True,
+                "displayStatus": "HOLDING_ACTIVE_SIGNAL",
+                "entryPrice": active_signal.get("entryPrice"),
+                "stopLoss": active_signal.get("stopLoss"),
+                "takeProfit": active_signal.get("takeProfit"),
+                "slPips": active_signal.get("slPips"),
+                "tpPips": active_signal.get("tpPips"),
+                "rrRatio": active_signal.get("rrRatio"),
+                "createdAt": active_signal.get("createdAt"),
+                "memoryActive": True,
+                "memoryReason": reason,
+                "barsHeld": int(active_signal.get("barsHeld") or 0),
+                "weakContinuationBars": int(active_signal.get("weakContinuationBars") or 0),
+                "lastEvaluatedCandleTime": active_signal.get("lastEvaluatedCandleTime"),
+                "exitReason": None,
+            }
+        )
+        return signal
+
+
+signal_memory = SignalMemory(
+    strong_reversal_score=SIGNAL_MEMORY_STRONG_REVERSAL_SCORE,
+    weak_continuation_bars=SIGNAL_MEMORY_WEAK_CONTINUATION_BARS,
+)
+
+
 def _direction_for_action_state(action_state):
     if action_state == "LONG_ACTIVE":
         return "bullish"
@@ -700,7 +891,12 @@ def _build_authoritative_signal_state(prediction, status=None):
         "suppressionReasons": suppression_reasons,
         "dataStatus": app_status,
         "candleIsClosed": candle_is_closed,
-        "gracePeriodActive": bool(prediction.get("grace_period_active")),
+        "memoryActive": bool(prediction.get("memoryActive")),
+        "memoryReason": prediction.get("memoryReason"),
+        "barsHeld": prediction.get("barsHeld"),
+        "weakContinuationBars": prediction.get("weakContinuationBars"),
+        "exitReason": prediction.get("exitReason"),
+        "previousActiveSignal": prediction.get("previousActiveSignal"),
     }
 
 
@@ -716,9 +912,12 @@ def _candidate_signal_fields(prediction):
     candle_is_closed = validation.get("candleIsClosed")
     if candle_is_closed is None:
         candle_is_closed = prediction.get("candle_is_closed", True) is not False
-    grace_period_active = validation.get("gracePeriodActive")
-    if grace_period_active is None:
-        grace_period_active = bool(prediction.get("grace_period_active"))
+    forecast = prediction.get("forecast") if isinstance(prediction.get("forecast"), dict) else {}
+    raw_direction = _normalize_signal_direction(
+        validation.get("candidateDirection")
+        or forecast.get("directionalBias")
+        or prediction.get("verdict")
+    )
     created_at = prediction.get("createdAt")
     if not created_at and action_state in ACTIVE_ACTION_STATES:
         created_at = prediction.get("lastUpdate") or prediction.get("timestamp")
@@ -736,6 +935,8 @@ def _candidate_signal_fields(prediction):
         "blockers": list(blockers),
         "activeTrade": bool(validation.get("activeTrade")),
         "displayStatus": validation.get("displayStatus") or ("Signal Active" if action_state in ACTIVE_ACTION_STATES else "Waiting for Signal"),
+        "rawDirection": raw_direction,
+        "currentPrice": prediction.get("currentPrice"),
         "entryPrice": prediction.get("entryPrice"),
         "stopLoss": prediction.get("stopLoss"),
         "takeProfit": prediction.get("takeProfit"),
@@ -750,7 +951,13 @@ def _candidate_signal_fields(prediction):
         "candleTimestamp": _prediction_candle_timestamp(prediction),
         "dataStatus": validation.get("dataStatus") or prediction.get("status") or "active",
         "candleIsClosed": bool(candle_is_closed),
-        "gracePeriodActive": bool(grace_period_active),
+        "memoryActive": bool(prediction.get("memoryActive") or validation.get("memoryActive")),
+        "memoryReason": prediction.get("memoryReason") or validation.get("memoryReason"),
+        "barsHeld": prediction.get("barsHeld") or validation.get("barsHeld"),
+        "weakContinuationBars": prediction.get("weakContinuationBars")
+        or validation.get("weakContinuationBars"),
+        "exitReason": prediction.get("exitReason") or validation.get("exitReason"),
+        "previousActiveSignal": prediction.get("previousActiveSignal") or validation.get("previousActiveSignal"),
     }
     for field in SIGNAL_SNAPSHOT_METADATA_FIELDS:
         fields[field] = prediction.get(field)
@@ -787,9 +994,24 @@ def _blocked_wait_fields(candidate, reason):
             "tpPips": None,
             "rrRatio": None,
             "createdAt": None,
+            "memoryActive": False,
+            "memoryReason": reason,
+            "barsHeld": None,
+            "exitReason": None,
         }
     )
     return blocked
+
+
+def _memory_exit_wait_fields(candidate, active_signal, reason):
+    exited = _blocked_wait_fields(candidate, reason)
+    exited["signals"] = [f"Signal memory exit: {reason.replace('_', ' ').title()}"]
+    exited["memoryActive"] = False
+    exited["memoryReason"] = "EXIT"
+    exited["exitReason"] = reason
+    exited["previousActiveSignal"] = _json_safe(active_signal)
+    exited["displayStatus"] = "Waiting for Signal"
+    return exited
 
 
 def _active_runtime_signal_fields(candidate):
@@ -802,36 +1024,7 @@ def _active_runtime_signal_fields(candidate):
     if action_state not in ACTIVE_ACTION_STATES:
         return None
 
-    is_long = action_state == "LONG_ACTIVE"
-    preserved = dict(candidate)
-    preserved.update(
-        {
-            "actionState": action_state,
-            "direction": "bullish" if is_long else "bearish",
-            "action": "buy" if is_long else "sell",
-            "verdict": "Bullish" if is_long else "Bearish",
-            "tradeabilityLabel": active_signal.get("lastConfirmedTradeability")
-            or candidate.get("tradeabilityLabel")
-            or "Medium",
-            "confidence": _finite_float(active_signal.get("lastConfirmedConfidence"))
-            or candidate.get("confidence")
-            or 50.0,
-            "score": _finite_float(active_signal.get("lastConfirmedScore"))
-            or candidate.get("score")
-            or 0.0,
-            "blockers": [],
-            "activeTrade": True,
-            "displayStatus": "Signal Active",
-            "entryPrice": active_signal.get("entryPrice"),
-            "stopLoss": active_signal.get("stopLoss"),
-            "takeProfit": active_signal.get("takeProfit"),
-            "slPips": active_signal.get("slPips"),
-            "tpPips": active_signal.get("tpPips"),
-            "rrRatio": active_signal.get("rrRatio"),
-            "createdAt": active_signal.get("createdAt"),
-        }
-    )
-    return preserved
+    return signal_memory.to_active_prediction(candidate, active_signal, reason="HOLDING")
 
 
 def _preserve_runtime_risk_fields(signal):
@@ -878,6 +1071,13 @@ def _compose_validated_signal_prediction(prediction, signal, candidate, notifica
     validated["rrRatio"] = signal.get("rrRatio")
     validated["createdAt"] = signal.get("createdAt")
     validated["signals"] = list(signal.get("signals") or [])
+    validated["memoryActive"] = bool(signal.get("memoryActive"))
+    validated["memoryReason"] = signal.get("memoryReason")
+    validated["barsHeld"] = signal.get("barsHeld")
+    validated["weakContinuationBars"] = signal.get("weakContinuationBars")
+    validated["lastEvaluatedCandleTime"] = signal.get("lastEvaluatedCandleTime")
+    validated["exitReason"] = signal.get("exitReason")
+    validated["previousActiveSignal"] = signal.get("previousActiveSignal")
     validated["forecast"]["score"] = signal["score"]
     validated["forecast"]["scoreThreshold"] = signal["threshold"]
     validated["signalScoreThreshold"] = signal["threshold"]
@@ -903,19 +1103,25 @@ def _compose_validated_signal_prediction(prediction, signal, candidate, notifica
         "signalPrice": signal.get("entryPrice"),
         "stopLoss": signal.get("stopLoss"),
         "takeProfit": signal.get("takeProfit"),
+        "memoryActive": bool(signal.get("memoryActive")),
+        "memoryReason": signal.get("memoryReason"),
+        "barsHeld": signal.get("barsHeld"),
+        "weakContinuationBars": signal.get("weakContinuationBars"),
+        "lastEvaluatedCandleTime": signal.get("lastEvaluatedCandleTime"),
+        "exitReason": signal.get("exitReason"),
+        "previousActiveSignal": signal.get("previousActiveSignal"),
         "suppressionReasons": suppression_reasons,
         "dataStatus": candidate.get("dataStatus"),
         "candleIsClosed": candidate.get("candleIsClosed", True),
-        "gracePeriodActive": candidate.get("gracePeriodActive", False),
         "candidateState": candidate["actionState"],
         "candidateSignal": candidate["actionState"],
         "candidateDirection": candidate["direction"],
+        "candidateRawDirection": candidate.get("rawDirection"),
         "candidateBias": candidate["verdict"],
         "candidateScore": candidate["score"],
         "candidateConfidence": candidate["confidence"],
         "candidateBlockers": list(candidate.get("blockers") or []),
         "candidateCandleIsClosed": candidate.get("candleIsClosed", True),
-        "candidateGracePeriodActive": candidate.get("gracePeriodActive", False),
         "transitionAllowed": notification_allowed,
         "notificationAllowed": notification_allowed,
         "suppressionOrWaitReason": reason,
@@ -935,7 +1141,8 @@ def _log_signal_snapshot_decision(symbol, candidate, signal, notification_allowe
         "Signal snapshot symbol=%s raw_candidate=%s resolved_state=%s candidate_direction=%s "
         "resolved_direction=%s candidate_bias=%s resolved_bias=%s candidate_score=%.2f "
         "resolved_score=%.2f candidate_confidence=%.1f resolved_confidence=%.1f blockers=%s "
-        "notification_allowed=%s suppression_reason=%s snapshot_timestamp=%s candle_timestamp=%s",
+        "memory_active=%s bars_held=%s exit_reason=%s notification_allowed=%s "
+        "suppression_reason=%s snapshot_timestamp=%s candle_timestamp=%s",
         symbol,
         candidate["actionState"],
         signal["actionState"],
@@ -948,6 +1155,9 @@ def _log_signal_snapshot_decision(symbol, candidate, signal, notification_allowe
         candidate["confidence"],
         signal["confidence"],
         candidate.get("blockers", []),
+        signal.get("memoryActive"),
+        signal.get("barsHeld"),
+        signal.get("exitReason"),
         notification_allowed,
         reason,
         candidate.get("timestamp"),
@@ -956,6 +1166,8 @@ def _log_signal_snapshot_decision(symbol, candidate, signal, notification_allowe
 
 
 def _resolve_signal_snapshot(prediction, now=None, advance=True):
+    global active_trade_state, risk_state
+
     now = now or datetime.now(timezone.utc)
     candidate = _candidate_signal_fields(prediction)
     symbol = candidate["symbol"]
@@ -969,31 +1181,68 @@ def _resolve_signal_snapshot(prediction, now=None, advance=True):
         snapshot_timestamp = candidate.get("snapshotTimestamp")
         last_snapshot_timestamp = state.get("lastSnapshotTimestamp")
 
+        with risk_lock:
+            active_memory = (
+                dict(active_trade_state)
+                if active_trade_state and active_trade_state.get("status") == "OPEN"
+                else None
+            )
+
+        data_invalid_reason = None
         if candidate.get("dataStatus") != "active":
-            reason = f"data status {candidate.get('dataStatus')} blocks active signal"
-            signal = _blocked_wait_fields(candidate, reason)
-            notification_allowed = False
-        elif candidate.get("candleIsClosed") is False:
-            preserved_signal = _active_runtime_signal_fields(candidate)
-            reason = "suppressed_incomplete_candle"
-            if preserved_signal is not None:
-                signal = preserved_signal
-            else:
-                signal = _blocked_wait_fields(candidate, reason)
-            notification_allowed = False
+            data_invalid_reason = f"data status {candidate.get('dataStatus')} blocks active signal"
         elif snapshot_timestamp and last_snapshot_timestamp and snapshot_timestamp <= last_snapshot_timestamp:
-            reason = "duplicate or out-of-order snapshot ignored"
-            notification_allowed = False
+            data_invalid_reason = "duplicate or out-of-order snapshot ignored"
         elif _snapshot_is_stale(candidate, now):
-            reason = "stale snapshot ignored"
+            data_invalid_reason = "stale snapshot ignored"
+
+        if active_memory and data_invalid_reason in {
+            "duplicate or out-of-order snapshot ignored",
+            "stale snapshot ignored",
+        }:
+            reason = data_invalid_reason
+            signal = signal_memory.to_active_prediction(candidate, active_memory, reason="HOLDING_STALE_OR_DUPLICATE_DATA")
+            notification_allowed = False
+        elif data_invalid_reason:
+            reason = data_invalid_reason
             signal = _blocked_wait_fields(candidate, reason)
             notification_allowed = False
-        elif candidate.get("gracePeriodActive") and candidate["actionState"] == "WAIT":
-            preserved_signal = _active_runtime_signal_fields(candidate)
-            if preserved_signal is not None:
-                reason = "suppressed_bar_open_instability"
-                signal = preserved_signal
-                notification_allowed = False
+        elif active_memory:
+            exit_reason, updated_memory = signal_memory.can_exit(active_memory, candidate, now=now)
+            if exit_reason:
+                current_price = _finite_float(candidate.get("currentPrice"))
+                closed_memory = signal_memory.clear(updated_memory, exit_reason, current_price=current_price, now=now)
+                reason = exit_reason
+                signal = _memory_exit_wait_fields(candidate, closed_memory, exit_reason)
+                notification_allowed = True
+                if advance:
+                    closed_signal_key = closed_memory.get("signalIdentityKey") or _active_signal_identity_key(closed_memory)
+                    closed_signal_base_key = (
+                        closed_memory.get("signalBaseIdentityKey")
+                        or _active_signal_base_identity_key(closed_memory)
+                    )
+                    with risk_lock:
+                        active_trade_state = None
+                        risk_state = _empty_risk_state(
+                            slHit=exit_reason == "STOP_LOSS_HIT",
+                            tpHit=exit_reason == "TAKE_PROFIT_HIT",
+                            exitReason=exit_reason,
+                            exitPrice=round(current_price, 2) if current_price is not None else None,
+                            exitTime=now.isoformat(),
+                            closedSignalKey=closed_signal_key,
+                            closedSignalBaseKey=closed_signal_base_key,
+                            closedSignalAction=closed_memory.get("action"),
+                            closedSignalCandle=closed_memory.get("candleUsedForSignal")
+                            or closed_memory.get("lastClosedCandleTime"),
+                            closedSignalSnapshotId=closed_memory.get("signalSnapshotId"),
+                        )
+            else:
+                reason = "signal memory holding active signal"
+                signal = signal_memory.to_active_prediction(candidate, updated_memory, reason="HOLDING")
+                notification_allowed = True
+                if advance:
+                    with risk_lock:
+                        active_trade_state = dict(updated_memory)
         elif candidate["actionState"] in ACTIVE_ACTION_STATES:
             closed_exit_reason = _closed_signal_exit_reason(candidate)
             if closed_exit_reason:
@@ -1086,18 +1335,33 @@ def _build_server_signal_snapshot(prediction):
         "suppressionReasons": list(validation.get("suppressionReasons") or []),
         "displayStatus": validation.get("displayStatus") or "Waiting for Signal",
         "dataStatus": validation.get("dataStatus") or "active",
+        "memoryActive": bool(validation.get("memoryActive", normalized.get("memoryActive", False))),
+        "memoryReason": validation.get("memoryReason") or normalized.get("memoryReason"),
+        "barsHeld": validation.get("barsHeld") or normalized.get("barsHeld"),
+        "weakContinuationBars": validation.get("weakContinuationBars")
+        or normalized.get("weakContinuationBars"),
+        "lastEvaluatedCandleTime": validation.get("lastEvaluatedCandleTime")
+        or normalized.get("lastEvaluatedCandleTime"),
+        "exitReason": validation.get("exitReason") or normalized.get("exitReason"),
+        "previousActiveSignal": validation.get("previousActiveSignal") or normalized.get("previousActiveSignal"),
         "signalSnapshotId": validation.get("signalSnapshotId") or normalized.get("signal_snapshot_id"),
         "calculationTime": validation.get("calculationTime") or normalized.get("calculation_time"),
         "latestProviderCandleTime": validation.get("latestProviderCandleTime") or normalized.get("latest_provider_candle_time"),
         "lastClosedCandleTime": validation.get("lastClosedCandleTime") or normalized.get("last_closed_candle_time"),
         "candleUsedForSignal": validation.get("candleUsedForSignal") or normalized.get("candle_used_for_signal"),
         "candleIsClosed": bool(validation.get("candleIsClosed", normalized.get("candle_is_closed", True))),
-        "gracePeriodActive": bool(validation.get("gracePeriodActive", normalized.get("grace_period_active", False))),
         "timestamp": normalized.get("lastUpdate") or normalized.get("timestamp"),
     }
 
 
 def _build_server_alert_title(previous_snapshot, current_snapshot):
+    exit_reason = current_snapshot.get("exitReason")
+    if exit_reason == "STOP_LOSS_HIT":
+        return "XAU/USD stop loss hit"
+    if exit_reason == "TAKE_PROFIT_HIT":
+        return "XAU/USD take profit hit"
+    if exit_reason:
+        return "XAU/USD signal exited"
     if previous_snapshot["actionState"] != current_snapshot["actionState"] and current_snapshot["actionState"] in {"LONG_ACTIVE", "SHORT_ACTIVE"}:
         return "XAU/USD long signal active" if current_snapshot["action"] == "buy" else "XAU/USD short signal active"
     if previous_snapshot["actionState"] in {"LONG_ACTIVE", "SHORT_ACTIVE"} and current_snapshot["actionState"] == "WAIT":
@@ -1189,6 +1453,8 @@ def _describe_server_signal_change(previous_snapshot, current_snapshot):
     if previous_snapshot["actionState"] != current_snapshot["actionState"]:
         changes.append(f"Action {previous_snapshot['actionState']} -> {current_snapshot['actionState']}")
         severity = "success" if current_snapshot["actionState"] in {"LONG_ACTIVE", "SHORT_ACTIVE"} else "warn"
+    if current_snapshot.get("exitReason"):
+        changes.append(f"Exit reason: {current_snapshot['exitReason']}")
     if previous_snapshot["verdict"] != current_snapshot["verdict"]:
         changes.append(f"Bias {previous_snapshot['verdict']} -> {current_snapshot['verdict']}")
     if previous_snapshot["tradeabilityLabel"] != current_snapshot["tradeabilityLabel"]:
@@ -1378,6 +1644,19 @@ def _active_signal_from_prediction(prediction, now=None):
     )
     signals = prediction.get("signals") if isinstance(prediction.get("signals"), list) else []
     is_long = action_state == "LONG_ACTIVE"
+    bars_held = prediction.get("barsHeld")
+    if bars_held is None:
+        bars_held = validation.get("barsHeld")
+    weak_continuation_bars = prediction.get("weakContinuationBars")
+    if weak_continuation_bars is None:
+        weak_continuation_bars = validation.get("weakContinuationBars")
+    last_evaluated_candle_time = (
+        validation.get("lastEvaluatedCandleTime")
+        or prediction.get("lastEvaluatedCandleTime")
+        or validation.get("candleUsedForSignal")
+        or prediction.get("candle_used_for_signal")
+    )
+
     active_signal = {
         "symbol": _prediction_symbol(prediction),
         "direction": "LONG" if is_long else "SHORT",
@@ -1396,10 +1675,21 @@ def _active_signal_from_prediction(prediction, now=None):
         "lastConfirmedConfidence": prediction.get("confidence"),
         "lastConfirmedTradeability": validation.get("tradeabilityLabel")
         or prediction.get("tradeabilityLabel"),
+        "entryScore": validation.get("score") or _prediction_score(prediction),
+        "barsHeld": bars_held or 0,
+        "weakContinuationBars": weak_continuation_bars or 0,
         "signalSnapshotId": validation.get("signalSnapshotId") or prediction.get("signal_snapshot_id"),
         "candleUsedForSignal": validation.get("candleUsedForSignal") or prediction.get("candle_used_for_signal"),
         "lastClosedCandleTime": validation.get("lastClosedCandleTime") or prediction.get("last_closed_candle_time"),
         "calculationTime": validation.get("calculationTime") or prediction.get("calculation_time"),
+        "entrySnapshotId": validation.get("signalSnapshotId") or prediction.get("signal_snapshot_id"),
+        "entryCandleTime": validation.get("candleUsedForSignal") or prediction.get("candle_used_for_signal"),
+        "lastEvaluatedCandleTime": last_evaluated_candle_time,
+        "lastUpdateTime": (now or datetime.now(timezone.utc)).isoformat(),
+        "lastExitReason": None,
+        "memoryActive": True,
+        "memoryReason": prediction.get("memoryReason") or validation.get("memoryReason") or "COMMITTED",
+        "exitReason": None,
         "status": "OPEN",
     }
     active_signal["signalIdentityKey"] = _active_signal_identity_key(active_signal)
@@ -1407,13 +1697,47 @@ def _active_signal_from_prediction(prediction, now=None):
     return active_signal
 
 
+def _signal_block_should_preserve_risk_engine(prediction):
+    if not isinstance(prediction, dict):
+        return False
+    validation = prediction.get("signalValidation") if isinstance(prediction.get("signalValidation"), dict) else {}
+    if prediction.get("exitReason") or validation.get("exitReason"):
+        return False
+    reasons = [
+        str(reason).lower()
+        for reason in validation.get("suppressionReasons", [])
+        if str(reason).strip()
+    ]
+    data_status = str(validation.get("dataStatus") or prediction.get("status") or "").lower()
+    if data_status and data_status != "active":
+        return True
+    return any(
+        "stale snapshot" in reason
+        or "duplicate or out-of-order snapshot" in reason
+        or "data status" in reason
+        for reason in reasons
+    )
+
+
 def _sync_active_trade_state(prediction, now=None):
     global active_trade_state, risk_state
 
     now = now or datetime.now(timezone.utc)
     next_active_signal = _active_signal_from_prediction(prediction, now=now)
+    next_active_signal = signal_memory.commit(next_active_signal, now=now) if next_active_signal else None
     with risk_lock:
         if next_active_signal is None:
+            if (
+                active_trade_state
+                and active_trade_state.get("status") == "OPEN"
+                and _signal_block_should_preserve_risk_engine(prediction)
+            ):
+                logger.info(
+                    "Preserving active risk engine through non-actionable signal snapshot action=%s reason=%s",
+                    active_trade_state.get("action"),
+                    prediction.get("signalValidation", {}).get("suppressionReasons"),
+                )
+                return dict(active_trade_state)
             if risk_state.get("exitReason") is None:
                 active_trade_state = None
             return None
@@ -1453,6 +1777,18 @@ def _sync_active_trade_state(prediction, now=None):
                     "lastConfirmedTradeability": next_active_signal.get("lastConfirmedTradeability"),
                     "signalSnapshotId": next_active_signal.get("signalSnapshotId"),
                     "calculationTime": next_active_signal.get("calculationTime"),
+                    "barsHeld": next_active_signal.get("barsHeld", active_trade_state.get("barsHeld", 0)),
+                    "weakContinuationBars": next_active_signal.get(
+                        "weakContinuationBars",
+                        active_trade_state.get("weakContinuationBars", 0),
+                    ),
+                    "lastEvaluatedCandleTime": next_active_signal.get(
+                        "lastEvaluatedCandleTime",
+                        active_trade_state.get("lastEvaluatedCandleTime"),
+                    ),
+                    "lastUpdateTime": next_active_signal.get("lastUpdateTime"),
+                    "memoryActive": True,
+                    "memoryReason": next_active_signal.get("memoryReason") or "HOLDING",
                     "status": "OPEN",
                 }
             )
@@ -1961,16 +2297,9 @@ def build_intrabar_signal_metadata(df, timeframe=DEFAULT_INTERVAL, now=None):
         now,
     )
     bar_age_seconds = None
-    grace_period_active = False
-    grace_remaining_seconds = 0
 
     if current_open is not None:
         bar_age_seconds = max(0, int((now - current_open).total_seconds()))
-        grace_period_active = (
-            BAR_OPEN_GRACE_SECONDS > 0
-            and 0 <= bar_age_seconds < BAR_OPEN_GRACE_SECONDS
-        )
-        grace_remaining_seconds = max(0, BAR_OPEN_GRACE_SECONDS - bar_age_seconds)
 
     provider_candle_is_closed = (
         current_open is None
@@ -1986,7 +2315,11 @@ def build_intrabar_signal_metadata(df, timeframe=DEFAULT_INTERVAL, now=None):
             DEFAULT_SYMBOL,
         )
 
-    signal_candle_timestamp = last_closed_timestamp if current_open is not None else latest_provider_timestamp
+    signal_candle_timestamp = (
+        last_closed_timestamp
+        if provider_candle_is_closed
+        else latest_provider_timestamp
+    )
     signal_candle_is_closed = (
         current_open is None
         or pd.Timestamp(signal_candle_timestamp) < pd.Timestamp(current_open)
@@ -2011,29 +2344,10 @@ def build_intrabar_signal_metadata(df, timeframe=DEFAULT_INTERVAL, now=None):
     new_bar_detected_at = calculation_time if new_bar_detected else bar_state.get("newBarDetectedAt")
     if new_bar_detected:
         logger.info(
-            "New %s bar detected symbol=%s last_bar=%s current_bar=%s grace_period_seconds=%s",
+            "New %s bar detected symbol=%s last_bar=%s current_bar=%s",
             timeframe,
             DEFAULT_SYMBOL,
             previous_current_bar,
-            current_bar_iso,
-            BAR_OPEN_GRACE_SECONDS,
-        )
-
-    if grace_period_active:
-        logger.info(
-            "Bar-open grace active symbol=%s timeframe=%s current_bar=%s remaining_seconds=%s "
-            "latest_provider_candle=%s",
-            DEFAULT_SYMBOL,
-            timeframe,
-            current_bar_iso,
-            grace_remaining_seconds,
-            latest_provider_iso,
-        )
-    elif bar_state.get("gracePeriodActive"):
-        logger.info(
-            "Bar-open grace ended symbol=%s timeframe=%s current_bar=%s; signal expiry can be evaluated.",
-            DEFAULT_SYMBOL,
-            timeframe,
             current_bar_iso,
         )
 
@@ -2049,15 +2363,12 @@ def build_intrabar_signal_metadata(df, timeframe=DEFAULT_INTERVAL, now=None):
         "lastBarTime": last_bar_time,
         "newBarDetectedAt": new_bar_detected_at,
         "barAgeSeconds": bar_age_seconds,
-        "gracePeriodActive": bool(grace_period_active),
-        "gracePeriodSeconds": BAR_OPEN_GRACE_SECONDS,
-        "graceRemainingSeconds": grace_remaining_seconds,
     }
 
     logger.info(
         "Intrabar signal metadata now=%s timeframe=%s latest_provider_candle=%s "
         "current_candle_open=%s last_closed_candle=%s candle_used_for_signal=%s "
-        "candle_is_closed=%s grace_period_active=%s rows=%s",
+        "candle_is_closed=%s rows=%s",
         calculation_time,
         timeframe,
         latest_provider_iso,
@@ -2065,7 +2376,6 @@ def build_intrabar_signal_metadata(df, timeframe=DEFAULT_INTERVAL, now=None):
         last_closed_iso,
         signal_candle_iso,
         signal_candle_is_closed,
-        grace_period_active,
         len(df),
     )
 
@@ -2073,11 +2383,11 @@ def build_intrabar_signal_metadata(df, timeframe=DEFAULT_INTERVAL, now=None):
         "signal_snapshot_id": snapshot_id,
         "calculation_time": calculation_time,
         "latest_provider_candle_time": latest_provider_iso,
+        "current_candle_open": current_bar_iso,
         "last_closed_candle_time": last_closed_iso,
         "candle_used_for_signal": signal_candle_iso,
         "candle_is_closed": bool(signal_candle_is_closed),
-        "grace_period_active": bool(grace_period_active),
-        "excluded_current_candle": bool(latest_provider_timestamp != signal_candle_timestamp),
+        "excluded_current_candle": False,
         "excluded_single_tick_count": excluded_single_tick_count,
         "excluded_empty_closed_candle_count": excluded_empty_closed_count,
     }
@@ -2085,20 +2395,33 @@ def build_intrabar_signal_metadata(df, timeframe=DEFAULT_INTERVAL, now=None):
     return metadata
 
 
-def _closed_signal_frame(df, metadata):
+def _signal_analysis_frame(df, metadata):
     if df is None or df.empty:
         raise ValueError("No candles available for signal calculation")
 
     candle_used = _parse_datetime(metadata.get("candle_used_for_signal"))
     if candle_used is None:
-        raise ValueError("No closed candle is available for signal calculation")
+        raise ValueError("No candle is available for signal calculation")
 
     candle_used = pd.Timestamp(candle_used)
-    closed_df = df.loc[df.index <= candle_used].copy()
-    if closed_df.empty:
-        raise ValueError("No closed candles remained for signal calculation")
-    closed_df.attrs.update(metadata)
-    return closed_df
+    signal_df = df.loc[df.index <= candle_used].copy()
+    if signal_df.empty:
+        raise ValueError("No candles remained for signal calculation")
+
+    current_open = _parse_datetime(metadata.get("current_candle_open"))
+    if current_open is not None:
+        current_open = pd.Timestamp(current_open)
+        empty_closed_index = [
+            timestamp
+            for timestamp, row in signal_df.iterrows()
+            if timestamp < current_open and _single_tick_candle_shape(row)
+        ]
+        if empty_closed_index:
+            signal_df = signal_df.drop(index=empty_closed_index)
+    if signal_df.empty:
+        raise ValueError("No usable candles remained for signal calculation")
+    signal_df.attrs.update(metadata)
+    return signal_df
 
 
 def normalize_ohlcv_frame(frame):
@@ -2193,7 +2516,7 @@ def generate_prediction(notify=True):
 
             provider_df = fetch_xauusd_data(period=DEFAULT_PERIOD, interval=DEFAULT_INTERVAL)
             signal_metadata = build_intrabar_signal_metadata(provider_df, DEFAULT_INTERVAL, now=now)
-            signal_source_df = _closed_signal_frame(provider_df, signal_metadata)
+            signal_source_df = _signal_analysis_frame(provider_df, signal_metadata)
             df = prepare_data(signal_source_df, params=DEFAULT_PARAMS)
             df.attrs.update(signal_metadata)
 
@@ -2242,13 +2565,13 @@ def generate_prediction(notify=True):
 
             logger.info(
                 "Prediction generated from Twelve Data: %s @ %s%% snapshot=%s "
-                "candle_used_for_signal=%s last_closed_candle=%s grace_period_active=%s",
+                "candle_used_for_signal=%s last_closed_candle=%s memory_active=%s",
                 prediction["verdict"],
                 prediction["confidence"],
                 prediction.get("signal_snapshot_id"),
                 prediction.get("candle_used_for_signal"),
                 prediction.get("last_closed_candle_time"),
-                prediction.get("grace_period_active"),
+                prediction.get("memoryActive"),
             )
 
         except Exception as exc:
