@@ -621,6 +621,9 @@
     <script>
       const ALERT_STORAGE_KEY = "xauusd.pushAlertsEnabled";
       const PUSH_CLIENT_ID_KEY = "xauusd.pushClientId";
+      const SEEN_NOTIFICATION_EVENTS_KEY = "xauusd.lastSeenNotificationEventIds";
+      const SEEN_NOTIFICATION_EVENT_TTL_MS = 24 * 60 * 60 * 1000;
+      const MAX_SEEN_NOTIFICATION_EVENTS = 100;
 
       let priceChart = null;
       let refreshInterval = null;
@@ -727,6 +730,70 @@
           .trim();
       }
 
+      function loadSeenNotificationEventIds() {
+        try {
+          const parsed = JSON.parse(
+            localStorage.getItem(SEEN_NOTIFICATION_EVENTS_KEY) || "{}",
+          );
+          return parsed && typeof parsed === "object" ? parsed : {};
+        } catch (error) {
+          console.warn("Could not read seen notification events:", error);
+          return {};
+        }
+      }
+
+      function saveSeenNotificationEventIds(events) {
+        try {
+          localStorage.setItem(
+            SEEN_NOTIFICATION_EVENTS_KEY,
+            JSON.stringify(events),
+          );
+        } catch (error) {
+          console.warn("Could not save seen notification events:", error);
+        }
+      }
+
+      function rememberNotificationEventId(eventId, producer, metadata = {}) {
+        if (!eventId) {
+          return false;
+        }
+        const now = Date.now();
+        const events = loadSeenNotificationEventIds();
+        const compactedEntries = Object.entries(events)
+          .filter(([, record]) => {
+            const seenAt = Number(record && record.seenAt);
+            return Number.isFinite(seenAt) && now - seenAt <= SEEN_NOTIFICATION_EVENT_TTL_MS;
+          })
+          .sort((first, second) => Number(second[1].seenAt) - Number(first[1].seenAt))
+          .slice(0, MAX_SEEN_NOTIFICATION_EVENTS - 1);
+        const compacted = Object.fromEntries(compactedEntries);
+        const alreadySeen = Boolean(compacted[eventId]);
+        compacted[eventId] = {
+          seenAt: now,
+          producer: producer || "frontend_sync",
+          snapshotId: metadata.snapshotId || null,
+          visibilityState: document.visibilityState,
+        };
+        saveSeenNotificationEventIds(compacted);
+        return alreadySeen;
+      }
+
+      function notificationEventIdFromPrediction(data) {
+        if (!data || typeof data !== "object") {
+          return null;
+        }
+        const validation =
+          data.signalValidation && typeof data.signalValidation === "object"
+            ? data.signalValidation
+            : {};
+        return (
+          data.notificationEventId ||
+          data.notification_event_id ||
+          validation.notificationEventId ||
+          null
+        );
+      }
+
       function buildSignalSnapshot(data) {
         if (!data || data.error || data.status === "initializing") {
           return null;
@@ -769,6 +836,11 @@
           memoryActive: Boolean(validation.memoryActive || data.memoryActive),
           memoryReason: validation.memoryReason || data.memoryReason || null,
           exitReason: validation.exitReason || data.exitReason || null,
+          notificationEventId: notificationEventIdFromPrediction(data),
+          committedSignalSnapshotId:
+            data.committedSignalSnapshotId ||
+            validation.committedSignalSnapshotId ||
+            null,
         };
       }
 
@@ -1155,10 +1227,31 @@
         }
       }
 
-      function handleImportantSignalChange(data) {
+      function handleImportantSignalChange(data, producer = "frontend_poll") {
         const currentSnapshot = buildSignalSnapshot(data);
         if (!currentSnapshot) {
           return;
+        }
+        const eventId = currentSnapshot.notificationEventId;
+        const wasSeen = rememberNotificationEventId(eventId, producer, {
+          snapshotId:
+            currentSnapshot.committedSignalSnapshotId ||
+            data.signal_snapshot_id ||
+            null,
+        });
+        if (eventId) {
+          console.info("Signal notification sync", {
+            notificationEventId: eventId,
+            producer: producer,
+            osNotificationAttempted: false,
+            skippedReason: "frontend_not_notification_authority",
+            alreadySeen: wasSeen,
+            visibilityState: document.visibilityState,
+            snapshotId:
+              currentSnapshot.committedSignalSnapshotId ||
+              data.signal_snapshot_id ||
+              null,
+          });
         }
 
         if (!previousSignalSnapshot) {
@@ -1169,7 +1262,7 @@
         previousSignalSnapshot = currentSnapshot;
       }
 
-      async function fetchPrediction() {
+      async function fetchPrediction(producer = "frontend_poll") {
         const fetchSequence = ++predictionFetchSequence;
         try {
           const response = await fetch("/api/prediction", {
@@ -1183,7 +1276,7 @@
             return;
           }
           latestRenderedFetchSequence = fetchSequence;
-          updateDashboard(data);
+          updateDashboard(data, producer);
         } catch (error) {
           console.error("Fetch error:", error);
           showError("Failed to fetch prediction data");
@@ -1194,20 +1287,36 @@
         navigator.serviceWorker.addEventListener("message", (event) => {
           const message = event.data || {};
           if (message.type === "xauusd.signalPush") {
-            fetchPrediction();
+            rememberNotificationEventId(message.notificationEventId, "service_worker", {
+              snapshotId: message.snapshotId || null,
+            });
+            console.info("Signal notification sync", {
+              notificationEventId: message.notificationEventId || null,
+              producer: message.producer || "service_worker",
+              osNotificationAttempted: Boolean(message.osNotificationAttempted),
+              displayStatus: message.displayStatus || null,
+              skippedReason:
+                message.displayStatus && message.displayStatus.startsWith("skipped")
+                  ? message.displayStatus
+                  : null,
+              visibilityState: document.visibilityState,
+              snapshotId: message.snapshotId || null,
+            });
+            fetchPrediction("service_worker");
           }
         });
       }
 
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible") {
-          fetchPrediction();
+          fetchPrediction("app_resume");
         }
       });
-      window.addEventListener("focus", fetchPrediction);
-      window.addEventListener("online", fetchPrediction);
+      window.addEventListener("focus", () => fetchPrediction("app_focus"));
+      window.addEventListener("pageshow", () => fetchPrediction("app_resume"));
+      window.addEventListener("online", () => fetchPrediction("app_online"));
 
-      function updateDashboard(data) {
+      function updateDashboard(data, producer = "frontend_poll") {
         document.getElementById("loadingState").style.display = "none";
         document.getElementById("mainContent").style.display = "block";
         const signalSnapshot = buildSignalSnapshot(data) || {
@@ -1358,7 +1467,7 @@
           updateChart(data.chartData, signalSnapshot.verdict);
         }
 
-        handleImportantSignalChange(data);
+        handleImportantSignalChange(data, producer);
       }
 
       function updateChart(chartData, verdict) {
@@ -1486,8 +1595,8 @@
         .getElementById("notificationToggle")
         .addEventListener("click", toggleAlerts);
       bootstrapNotifications();
-      fetchPrediction();
-      refreshInterval = setInterval(fetchPrediction, 5000);
+      fetchPrediction("initial_load");
+      refreshInterval = setInterval(() => fetchPrediction("frontend_poll"), 5000);
     </script>
   </body>
 </html>

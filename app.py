@@ -1346,8 +1346,9 @@ def _build_server_signal_snapshot(prediction):
     confidence = _finite_float(normalized.get("confidence")) or 0.0
     score = _finite_float(validation.get("score")) or _prediction_score(normalized)
 
-    return {
+    snapshot = {
         "symbol": normalized.get("symbol") or DEFAULT_SYMBOL,
+        "timeframe": normalized.get("timeframe") or DEFAULT_INTERVAL,
         "verdict": validation.get("verdict") or normalized.get("verdict") or "Neutral",
         "action": validation.get("action") or normalized.get("action") or "hold",
         "actionState": validation.get("actionState") or normalized.get("actionState") or "WAIT",
@@ -1381,7 +1382,15 @@ def _build_server_signal_snapshot(prediction):
         "candleUsedForSignal": validation.get("candleUsedForSignal") or normalized.get("candle_used_for_signal"),
         "candleIsClosed": bool(validation.get("candleIsClosed", normalized.get("candle_is_closed", True))),
         "timestamp": normalized.get("lastUpdate") or normalized.get("timestamp"),
+        "notificationEventId": validation.get("notificationEventId") or normalized.get("notificationEventId"),
+        "notificationEventType": validation.get("notificationEventType") or normalized.get("notificationEventType"),
     }
+    snapshot["committedSignalSnapshotId"] = (
+        validation.get("committedSignalSnapshotId")
+        or normalized.get("committedSignalSnapshotId")
+        or _committed_signal_snapshot_id(snapshot)
+    )
+    return snapshot
 
 
 def _build_server_alert_title(previous_snapshot, current_snapshot):
@@ -1547,6 +1556,24 @@ def _set_notification_snapshot(snapshot):
     _save_last_notification_snapshot(last_notification_snapshot)
 
 
+def _remember_latest_notification_event(notification_event, delivery_status):
+    global latest_prediction
+
+    if not isinstance(notification_event, dict) or not notification_event.get("id"):
+        return
+    fields = {
+        "notificationEventId": notification_event.get("id"),
+        "notificationEventType": notification_event.get("eventType"),
+        "notificationEventDeliveryStatus": delivery_status,
+        "committedSignalSnapshotId": notification_event.get("finalSnapshotId"),
+    }
+    if isinstance(latest_prediction, dict):
+        latest_prediction.update(fields)
+        validation = latest_prediction.get("signalValidation")
+        if isinstance(validation, dict):
+            validation.update(fields)
+
+
 def _notification_direction(snapshot):
     action_state = (snapshot or {}).get("actionState")
     if action_state == "LONG_ACTIVE":
@@ -1587,7 +1614,7 @@ def _notification_time_bucket(value, bucket_seconds=300):
 def _notification_event_anchor(snapshot):
     snapshot = snapshot or {}
     return (
-        snapshot.get("signalSnapshotId")
+        snapshot.get("committedSignalSnapshotId")
         or snapshot.get("candleUsedForSignal")
         or snapshot.get("lastClosedCandleTime")
         or _notification_time_bucket(snapshot.get("timestamp"))
@@ -1603,6 +1630,27 @@ def _notification_lead_signal(snapshot):
     if signals_key:
         return _normalize_signal_text(signals_key.split("|", 1)[0]).lower()
     return ""
+
+
+def _committed_signal_snapshot_id(snapshot):
+    if not isinstance(snapshot, dict):
+        return None
+    canonical = {
+        "symbol": snapshot.get("symbol") or DEFAULT_SYMBOL,
+        "timeframe": snapshot.get("timeframe") or DEFAULT_INTERVAL,
+        "candle_time": snapshot.get("candleUsedForSignal")
+        or snapshot.get("lastClosedCandleTime")
+        or _notification_time_bucket(snapshot.get("timestamp"))
+        or "unknown",
+        "final_state": snapshot.get("actionState") or "WAIT",
+        "final_direction": _notification_direction(snapshot),
+        "final_action": snapshot.get("action") or "hold",
+        "exit_reason": snapshot.get("exitReason") or "",
+        "lead_signal": _notification_lead_signal(snapshot),
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()[:24]
+    return f"xauusd-committed-{digest}"
 
 
 def _build_notification_event(previous_snapshot, current_snapshot, generated_by="signal_transition"):
@@ -1631,7 +1679,9 @@ def _build_notification_event(previous_snapshot, current_snapshot, generated_by=
         "generatedBy": generated_by,
         "eventType": event_type,
         "symbol": canonical["symbol"],
-        "finalSnapshotId": current_snapshot.get("signalSnapshotId"),
+        "finalSnapshotId": current_snapshot.get("committedSignalSnapshotId")
+        or current_snapshot.get("signalSnapshotId"),
+        "rawSignalSnapshotId": current_snapshot.get("signalSnapshotId"),
         "finalState": canonical["final_state"],
         "finalDirection": canonical["final_direction"],
         "finalScore": current_snapshot.get("score"),
@@ -1766,6 +1816,7 @@ def _send_web_push_notification(title, body, severity, notification_event=None):
             "notification_event_id": event_id,
             "eventType": event_type,
             "signalSnapshotId": notification_event.get("finalSnapshotId") if isinstance(notification_event, dict) else None,
+            "rawSignalSnapshotId": notification_event.get("rawSignalSnapshotId") if isinstance(notification_event, dict) else None,
             "dedupeKey": event_id or f"{title}|{body}",
             "url": "/",
             "tag": notification_tag,
@@ -2171,7 +2222,10 @@ def _commit_risk_exit(active_signal, current_price, reason, timestamp, notify=Tr
         notification_event.get("id") if notification_event else None,
     )
     if notify and _claim_notification_event(notification_event):
+        _remember_latest_notification_event(notification_event, "sent")
         _send_web_push_notification(title, body, severity, notification_event=notification_event)
+    elif notification_event:
+        _remember_latest_notification_event(notification_event, "suppressed")
     return True
 
 
@@ -2265,6 +2319,7 @@ def _notify_signal_change(prediction):
     _set_notification_snapshot(current_snapshot)
     notification_event = change.get("event")
     if not _claim_notification_event(notification_event):
+        _remember_latest_notification_event(notification_event, "duplicate_skipped")
         _log_signal_transition(
             previous_snapshot,
             current_snapshot,
@@ -2272,6 +2327,7 @@ def _notify_signal_change(prediction):
             "duplicate canonical notification event",
         )
         return
+    _remember_latest_notification_event(notification_event, "sent")
     _log_signal_transition(previous_snapshot, current_snapshot, "sent", "push-worthy transition")
     _send_web_push_notification(
         change["title"],

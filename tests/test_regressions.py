@@ -1427,10 +1427,16 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIn("Ignoring duplicate signal event payload", response_body)
         self.assertIn("notificationEventId", response_body)
         self.assertIn("recentSignalEventIds", response_body)
+        self.assertIn("SIGNAL_NOTIFICATION_EVENT_CACHE", response_body)
+        self.assertIn("rememberStoredSignalEventId", response_body)
+        self.assertIn("hasStoredSignalEventId", response_body)
+        self.assertIn("persistent_event_seen", response_body)
         self.assertIn("renotify: false", response_body)
         self.assertIn('self.clients.matchAll', response_body)
         self.assertIn('type: "xauusd.signalPush"', response_body)
         self.assertIn("client.postMessage", response_body)
+        self.assertIn('producer: "service_worker"', response_body)
+        self.assertIn("osNotificationAttempted", response_body)
 
     def test_dashboard_does_not_show_duplicate_in_app_signal_toasts(self):
         response = self.client.get("/")
@@ -1440,8 +1446,14 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("showToast(`${change.title}", response_body)
         self.assertNotIn("new Notification", response_body)
+        self.assertNotIn("registration.showNotification", response_body)
         self.assertNotIn("describeImportantChange", response_body)
         self.assertNotIn("buildAlertTitle", response_body)
+        self.assertIn('SEEN_NOTIFICATION_EVENTS_KEY = "xauusd.lastSeenNotificationEventIds"', response_body)
+        self.assertIn("function rememberNotificationEventId", response_body)
+        self.assertIn("frontend_not_notification_authority", response_body)
+        self.assertIn('fetchPrediction("app_resume")', response_body)
+        self.assertIn('window.addEventListener("pageshow"', response_body)
 
     def test_dashboard_removes_bar_grace_status_band(self):
         response = self.client.get("/")
@@ -1478,8 +1490,8 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIn("Price Update", response_body)
         self.assertIn("data.priceUpdatedAt || data.price_updated_at", response_body)
         self.assertIn('message.type === "xauusd.signalPush"', response_body)
-        self.assertIn('window.addEventListener("focus", fetchPrediction)', response_body)
-        self.assertIn('window.addEventListener("online", fetchPrediction)', response_body)
+        self.assertIn('window.addEventListener("focus", () => fetchPrediction("app_focus"))', response_body)
+        self.assertIn('window.addEventListener("online", () => fetchPrediction("app_online"))', response_body)
 
     def test_dashboard_sends_stable_push_client_id_with_subscription(self):
         response = self.client.get("/")
@@ -1697,6 +1709,64 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(mocked_push.call_count, 1)
         self.assertEqual(mocked_push.call_args.args[0], "XAU/USD long signal active")
         self.assertEqual(mocked_push.call_args.kwargs["notification_event"]["id"], first_event["id"])
+
+    def test_app_open_recomputed_same_closed_candle_event_sends_once(self):
+        previous = self.wait_snapshot(score=25, has_blockers=True)
+        background_prediction = self.active_prediction_for_closed_candle(
+            "SHORT_ACTIVE",
+            score=55,
+            timestamp_offset=60,
+            candle_offset=0,
+            snapshot_suffix="background-push-snapshot",
+        )
+        app_open_prediction = self.active_prediction_for_closed_candle(
+            "SHORT_ACTIVE",
+            score=55,
+            timestamp_offset=240,
+            candle_offset=0,
+            snapshot_suffix="app-open-refresh-snapshot",
+        )
+        for prediction in (background_prediction, app_open_prediction):
+            prediction["confidence"] = 88
+            prediction["tradeabilityLabel"] = "Medium"
+            prediction["signals"] = ["VWAP bearish rejection (strength: 1.00)"]
+
+        background_prediction = app_module._ensure_validated_signal_prediction(
+            background_prediction,
+            now=datetime.fromisoformat(self.iso_at(60)),
+            advance=False,
+        )
+        app_open_prediction = app_module._ensure_validated_signal_prediction(
+            app_open_prediction,
+            now=datetime.fromisoformat(self.iso_at(240)),
+            advance=False,
+        )
+        background_snapshot = app_module._build_server_signal_snapshot(background_prediction)
+        app_open_snapshot = app_module._build_server_signal_snapshot(app_open_prediction)
+
+        self.assertNotEqual(background_snapshot["signalSnapshotId"], app_open_snapshot["signalSnapshotId"])
+        self.assertEqual(
+            background_snapshot["committedSignalSnapshotId"],
+            app_open_snapshot["committedSignalSnapshotId"],
+        )
+        self.assertEqual(
+            app_module._build_notification_event(previous, background_snapshot)["id"],
+            app_module._build_notification_event(previous, app_open_snapshot)["id"],
+        )
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module.latest_prediction = dict(background_prediction)
+            app_module.last_notification_snapshot = previous
+            app_module._notify_signal_change(background_prediction)
+            app_module.last_notification_snapshot = previous
+            app_module._notify_signal_change(app_open_prediction)
+
+        self.assertEqual(mocked_push.call_count, 1)
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD short signal active")
+        self.assertEqual(
+            app_module.latest_prediction["notificationEventId"],
+            mocked_push.call_args.kwargs["notification_event"]["id"],
+        )
 
     def test_legitimate_later_same_transition_gets_new_event_id(self):
         previous = self.wait_snapshot(score=25, has_blockers=True)
