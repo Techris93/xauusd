@@ -1087,6 +1087,45 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertTrue(app_module.latest_prediction["excluded_current_candle"])
         self.assertFalse(app_module.latest_prediction["grace_period_active"])
 
+    def test_post_grace_empty_closed_candle_is_skipped_for_signal_calculation(self):
+        fixed_now = datetime(2026, 4, 30, 10, 5, tzinfo=timezone.utc)
+        index = pd.date_range(
+            end=pd.Timestamp("2026-04-30T10:00:00Z"),
+            periods=120,
+            freq="h",
+            tz="UTC",
+        )
+        frame = self.build_frame(index=index)
+        frame.loc[pd.Timestamp("2026-04-30T09:00:00Z"), ["Open", "High", "Low", "Close"]] = 2402.0
+        frame.loc[pd.Timestamp("2026-04-30T09:00:00Z"), "Volume"] = 1.0
+        frame.loc[pd.Timestamp("2026-04-30T10:00:00Z"), ["Open", "High", "Low", "Close"]] = 2403.0
+        frame.loc[pd.Timestamp("2026-04-30T10:00:00Z"), "Volume"] = 1.0
+
+        def fake_compute(signal_df, params=None):
+            self.assertEqual(signal_df.index[-1], pd.Timestamp("2026-04-30T08:00:00Z"))
+            self.assertEqual(
+                signal_df.attrs.get("candle_used_for_signal"),
+                "2026-04-30T08:00:00+00:00",
+            )
+            self.assertEqual(signal_df.attrs.get("excluded_empty_closed_candle_count"), 1)
+            self.assertTrue(signal_df.attrs.get("excluded_current_candle"))
+            return self.active_prediction(
+                "LONG_ACTIVE",
+                score=78,
+                timestamp=fixed_now.isoformat(),
+                candle_timestamp="2026-04-30T08:00:00+00:00",
+            )
+
+        with mock.patch.object(app_module, "datetime", self.fixed_datetime(fixed_now)):
+            with mock.patch.object(app_module, "fetch_live_price", return_value=None):
+                with mock.patch.object(app_module, "fetch_xauusd_data", return_value=frame.copy()):
+                    with mock.patch.object(app_module, "compute_prediction", side_effect=fake_compute):
+                        app_module.generate_prediction(notify=False)
+
+        self.assertEqual(app_module.latest_prediction["candle_used_for_signal"], "2026-04-30T08:00:00+00:00")
+        self.assertEqual(app_module.latest_prediction["excluded_empty_closed_candle_count"], 1)
+        self.assertFalse(app_module.latest_prediction["grace_period_active"])
+
     def test_short_stop_loss_triggers_immediately_during_grace_period(self):
         timestamp = datetime(2026, 4, 30, 9, 2, tzinfo=timezone.utc)
         app_module.active_trade_state = {
@@ -1212,6 +1251,45 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(mocked_push.call_count, 2)
         self.assertEqual(mocked_push.call_args_list[0].args[0], "XAU/USD long signal active")
         self.assertEqual(mocked_push.call_args_list[1].args[0], "XAU/USD stop loss hit")
+        self.assertIsNone(app_module.active_trade_state)
+        self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
+        self.assertFalse(app_module.last_push_snapshot["notificationAllowed"])
+        self.assertIn(
+            "closed signal already exited: SL_HIT",
+            app_module.last_push_snapshot["blockers"],
+        )
+
+    def test_same_closed_candle_signal_does_not_rearm_when_revised_risk_changes(self):
+        app_module.last_push_snapshot = self.wait_snapshot(has_blockers=False)
+        first_signal = self.active_prediction_for_closed_candle(
+            "LONG_ACTIVE",
+            score=78,
+            timestamp_offset=1,
+            candle_offset=0,
+            snapshot_suffix="first-refresh",
+        )
+        revised_same_candle_signal = self.active_prediction_for_closed_candle(
+            "LONG_ACTIVE",
+            score=82,
+            timestamp_offset=20,
+            candle_offset=0,
+            snapshot_suffix="revised-risk-same-candle",
+        )
+        revised_same_candle_signal["entryPrice"] = 2401.0
+        revised_same_candle_signal["stopLoss"] = 2397.5
+        revised_same_candle_signal["takeProfit"] = 2409.0
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module._notify_signal_change(first_signal)
+            self.assertEqual(app_module.active_trade_state["action"], "LONG_ACTIVE")
+            triggered = app_module._process_live_price_tick(2396.9, self.timestamp_base + timedelta(seconds=10))
+            self.assertTrue(triggered)
+            self.assertEqual(app_module.risk_state["exitReason"], "SL_HIT")
+            self.assertIsNotNone(app_module.risk_state.get("closedSignalBaseKey"))
+
+            app_module._notify_signal_change(revised_same_candle_signal)
+
+        self.assertEqual(mocked_push.call_count, 2)
         self.assertIsNone(app_module.active_trade_state)
         self.assertEqual(app_module.last_push_snapshot["actionState"], "WAIT")
         self.assertFalse(app_module.last_push_snapshot["notificationAllowed"])

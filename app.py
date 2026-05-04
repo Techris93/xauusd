@@ -133,6 +133,7 @@ SIGNAL_SNAPSHOT_METADATA_FIELDS = (
     "candle_used_for_signal",
     "candle_is_closed",
     "grace_period_active",
+    "excluded_empty_closed_candle_count",
 )
 SIGNAL_PUSH_PAYLOAD_VERSION = "authoritative-signal-v2"
 SIGNAL_PUSH_MAX_AGE_SECONDS = 300
@@ -513,14 +514,39 @@ def _active_signal_identity_key(signal):
     )
 
 
+def _active_signal_base_identity_key(signal):
+    if not isinstance(signal, dict):
+        return None
+    action_state = signal.get("actionState") or signal.get("action")
+    candle_identity = _signal_candle_identity(signal)
+    if action_state not in ACTIVE_ACTION_STATES or not candle_identity:
+        return None
+    return "|".join(
+        [
+            str(signal.get("symbol") or DEFAULT_SYMBOL),
+            str(action_state),
+            str(candle_identity),
+        ]
+    )
+
+
 def _closed_signal_exit_reason(signal):
     signal_key = _active_signal_identity_key(signal)
-    if not signal_key:
+    signal_base_key = _active_signal_base_identity_key(signal)
+    if not signal_key and not signal_base_key:
         return None
     with risk_lock:
         closed_signal_key = risk_state.get("closedSignalKey")
+        closed_signal_base_key = risk_state.get("closedSignalBaseKey")
         exit_reason = risk_state.get("exitReason")
-    if signal_key and closed_signal_key and signal_key == closed_signal_key:
+    if (
+        (signal_key and closed_signal_key and signal_key == closed_signal_key)
+        or (
+            signal_base_key
+            and closed_signal_base_key
+            and signal_base_key == closed_signal_base_key
+        )
+    ):
         return f"closed signal already exited: {exit_reason or 'risk exit'}"
     return None
 
@@ -1377,6 +1403,7 @@ def _active_signal_from_prediction(prediction, now=None):
         "status": "OPEN",
     }
     active_signal["signalIdentityKey"] = _active_signal_identity_key(active_signal)
+    active_signal["signalBaseIdentityKey"] = _active_signal_base_identity_key(active_signal)
     return active_signal
 
 
@@ -1392,7 +1419,17 @@ def _sync_active_trade_state(prediction, now=None):
             return None
 
         next_signal_key = next_active_signal.get("signalIdentityKey") or _active_signal_identity_key(next_active_signal)
-        if next_signal_key and next_signal_key == risk_state.get("closedSignalKey"):
+        next_base_signal_key = (
+            next_active_signal.get("signalBaseIdentityKey")
+            or _active_signal_base_identity_key(next_active_signal)
+        )
+        if (
+            next_signal_key
+            and next_signal_key == risk_state.get("closedSignalKey")
+        ) or (
+            next_base_signal_key
+            and next_base_signal_key == risk_state.get("closedSignalBaseKey")
+        ):
             logger.info(
                 "Suppressing re-arm of closed signal symbol=%s action=%s candle=%s reason=%s",
                 next_active_signal.get("symbol") or DEFAULT_SYMBOL,
@@ -1511,7 +1548,12 @@ def _commit_risk_exit(active_signal, current_price, reason, timestamp, notify=Tr
 
         closed_active_signal = dict(active_signal)
         closed_signal_key = closed_active_signal.get("signalIdentityKey") or _active_signal_identity_key(closed_active_signal)
+        closed_signal_base_key = (
+            closed_active_signal.get("signalBaseIdentityKey")
+            or _active_signal_base_identity_key(closed_active_signal)
+        )
         closed_active_signal["signalIdentityKey"] = closed_signal_key
+        closed_active_signal["signalBaseIdentityKey"] = closed_signal_base_key
         risk_state = _empty_risk_state(
             slHit=reason == "SL_HIT",
             tpHit=reason == "TP_HIT",
@@ -1519,6 +1561,7 @@ def _commit_risk_exit(active_signal, current_price, reason, timestamp, notify=Tr
             exitPrice=round(current_price, 2),
             exitTime=timestamp.isoformat(),
             closedSignalKey=closed_signal_key,
+            closedSignalBaseKey=closed_signal_base_key,
             closedSignalAction=closed_active_signal.get("action"),
             closedSignalCandle=closed_active_signal.get("candleUsedForSignal")
             or closed_active_signal.get("lastClosedCandleTime"),
@@ -1864,6 +1907,28 @@ def get_last_closed_candle(df, timeframe, now=None):
     return closed_index[-1] if len(closed_index) else None
 
 
+def get_last_usable_closed_candle(df, timeframe, now=None):
+    """Return the latest closed candle that is not an empty/single-tick shell."""
+    if df is None or df.empty:
+        return None, 0
+
+    current_open = _current_candle_open(timeframe, now)
+    if current_open is None:
+        closed_index = df.index
+    else:
+        closed_index = df.index[df.index < pd.Timestamp(current_open)]
+
+    skipped_empty_count = 0
+    for timestamp in reversed(closed_index):
+        row = df.loc[timestamp]
+        if _single_tick_candle_shape(row):
+            skipped_empty_count += 1
+            continue
+        return timestamp, skipped_empty_count
+
+    return None, skipped_empty_count
+
+
 def _single_tick_candle_shape(row):
     try:
         open_price = float(row["Open"])
@@ -1890,7 +1955,11 @@ def build_intrabar_signal_metadata(df, timeframe=DEFAULT_INTERVAL, now=None):
     now = _coerce_utc_datetime(now or datetime.now(timezone.utc))
     latest_provider_timestamp = df.index[-1]
     current_open = _current_candle_open(timeframe, now)
-    last_closed_timestamp = get_last_closed_candle(df, timeframe, now)
+    last_closed_timestamp, excluded_empty_closed_count = get_last_usable_closed_candle(
+        df,
+        timeframe,
+        now,
+    )
     bar_age_seconds = None
     grace_period_active = False
     grace_remaining_seconds = 0
@@ -1909,6 +1978,13 @@ def build_intrabar_signal_metadata(df, timeframe=DEFAULT_INTERVAL, now=None):
     )
     if current_open is not None and last_closed_timestamp is None:
         raise ValueError("No fully closed candle is available for signal calculation")
+    if excluded_empty_closed_count:
+        logger.warning(
+            "Excluded %s empty closed %s candle(s) before signal calculation symbol=%s",
+            excluded_empty_closed_count,
+            timeframe,
+            DEFAULT_SYMBOL,
+        )
 
     signal_candle_timestamp = last_closed_timestamp if current_open is not None else latest_provider_timestamp
     signal_candle_is_closed = (
@@ -2003,6 +2079,7 @@ def build_intrabar_signal_metadata(df, timeframe=DEFAULT_INTERVAL, now=None):
         "grace_period_active": bool(grace_period_active),
         "excluded_current_candle": bool(latest_provider_timestamp != signal_candle_timestamp),
         "excluded_single_tick_count": excluded_single_tick_count,
+        "excluded_empty_closed_candle_count": excluded_empty_closed_count,
     }
     df.attrs.update(metadata)
     return metadata
