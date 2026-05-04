@@ -138,7 +138,9 @@ SIGNAL_PUSH_PAYLOAD_VERSION = "authoritative-signal-v2"
 SIGNAL_PUSH_MAX_AGE_SECONDS = 300
 MAX_OHLC_RANGE_RATIO = 0.20
 BAR_OPEN_GRACE_SECONDS = _read_bar_open_grace_seconds()
-SIGNAL_SCORE_THRESHOLD = float(DEFAULT_PARAMS.get("min_tradeability", 45))
+SIGNAL_SCORE_THRESHOLD = float(
+    DEFAULT_PARAMS.get("min_signal_score", DEFAULT_PARAMS.get("min_tradeability", 45))
+)
 
 
 def _empty_risk_state(**overrides):
@@ -757,6 +759,7 @@ def _blocked_wait_fields(candidate, reason):
             "takeProfit": None,
             "slPips": None,
             "tpPips": None,
+            "rrRatio": None,
             "createdAt": None,
         }
     )
@@ -846,8 +849,7 @@ def _compose_validated_signal_prediction(prediction, signal, candidate, notifica
     validated["takeProfit"] = signal.get("takeProfit")
     validated["slPips"] = signal.get("slPips")
     validated["tpPips"] = signal.get("tpPips")
-    if signal.get("rrRatio") is not None:
-        validated["rrRatio"] = signal.get("rrRatio")
+    validated["rrRatio"] = signal.get("rrRatio")
     validated["createdAt"] = signal.get("createdAt")
     validated["signals"] = list(signal.get("signals") or [])
     validated["forecast"]["score"] = signal["score"]
@@ -1024,6 +1026,7 @@ def _apply_authoritative_signal_state(prediction, status=None):
         normalized["takeProfit"] = None
         normalized["slPips"] = None
         normalized["tpPips"] = None
+        normalized["rrRatio"] = None
 
     return normalized
 

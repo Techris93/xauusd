@@ -33,7 +33,7 @@ DEFAULT_PARAMS = {
     "volume_weight": 1.0,
     "sr_weight": 1.8,              # INCREASED - key levels drive moves
     "min_confidence": 55,          # Lowered from 63 - allow earlier signals
-    "min_signal_score": 55,        # Entry score threshold
+    "min_signal_score": 45,        # Entry score threshold
     "min_tradeability": 45,        # Lowered from 52 - don't block valid setups
     "direction_threshold": 1.0,    # Lowered from 1.2 - easier directional trigger
     "session_filter": False,       # DISABLED - don't block Asian session moves
@@ -301,13 +301,14 @@ def calculate_anticipatory_score(df, params):
             score += 10
             neutral_evidence.append("Volume spike")
 
-    signals = []
+    aligned_signals = []
+    conflict_signals = []
     for side, _, text in directional_evidence:
         if direction != "neutral" and side != direction:
-            signals.append(f"Conflict: {text}")
+            conflict_signals.append(f"Conflict: {text}")
         else:
-            signals.append(text)
-    signals.extend(neutral_evidence)
+            aligned_signals.append(text)
+    signals = aligned_signals + neutral_evidence + conflict_signals
 
     return min(score, 100), direction, signals
 
@@ -593,7 +594,9 @@ def compute_prediction(df, params=None):
         "takeProfit": tp,
         "slPips": sl_pips,
         "tpPips": tp_pips,
-        "rrRatio": round(params['tp_atr_mult'] / params['sl_atr_mult'], 2),
+        "rrRatio": round(params['tp_atr_mult'] / params['sl_atr_mult'], 2)
+        if action_state in ["LONG_ACTIVE", "SHORT_ACTIVE"]
+        else None,
         "forecast": forecast,
         "signals": signals,
         "timestamp": datetime.now(timezone.utc).isoformat(),

@@ -548,21 +548,21 @@ class PredictorRegressionTests(unittest.TestCase):
         frame = pd.DataFrame([{"Close": 100.0}])
 
         confidence, verdict = calculate_confidence(
-            50,
+            44,
             "bullish",
             frame,
             app_module.DEFAULT_PARAMS,
         )
-        self.assertEqual(confidence, 75)
+        self.assertEqual(confidence, 72)
         self.assertEqual(verdict, "Neutral")
 
         confidence, verdict = calculate_confidence(
-            55,
+            45,
             "bullish",
             frame,
             app_module.DEFAULT_PARAMS,
         )
-        self.assertEqual(confidence, 78)
+        self.assertEqual(confidence, 72)
         self.assertEqual(verdict, "Bullish")
 
     def test_sr_bonus_requires_actual_break_not_nearby_level(self):
@@ -627,6 +627,71 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(prediction["actionState"], "WAIT")
         self.assertEqual(prediction["verdict"], "Neutral")
         self.assertIn("Tradeability 36.0 below threshold 45", prediction["blockers"])
+
+    def test_signal_list_leads_with_resolved_direction_before_conflicts(self):
+        frame = self.build_signal_frame().copy()
+        frame["Close"] = 4618.15
+        frame["Open"] = 4619.0
+        frame["High"] = 4621.0
+        frame["Low"] = 4617.0
+        frame["EMA_20"] = 4620.0
+        frame["EMA_50"] = 4625.0
+        frame["VWAP"] = 4625.0
+        frame["ADX_14"] = 24.7
+        frame["VOLUME_SPIKE"] = 0
+        frame["RECENT_SWING_LOW"] = 4620.0
+        frame["RECENT_SWING_HIGH"] = 4635.0
+
+        with mock.patch.object(signal_module, "detect_structure_break", return_value=("bullish_break", 1.0)):
+            with mock.patch.object(signal_module, "detect_vwap_rejection", return_value=("bearish_rejection", 1.0)):
+                score, direction, signals = calculate_anticipatory_score(frame, app_module.DEFAULT_PARAMS)
+
+        self.assertEqual(direction, "bearish")
+        self.assertEqual(score, 55)
+        self.assertEqual(signals[0], "VWAP bearish rejection (strength: 1.00)")
+        self.assertIn("Bearish MA alignment", signals[:3])
+        self.assertIn("Breaking key support", signals[:3])
+        self.assertEqual(signals[-1], "Conflict: Bullish structure break (strength: 1.00)")
+
+    def test_signal_engine_and_app_share_active_score_threshold(self):
+        frame = self.build_signal_frame()
+
+        self.assertEqual(signal_module.DEFAULT_PARAMS["min_signal_score"], 45)
+        self.assertEqual(app_module.SIGNAL_SCORE_THRESHOLD, 45)
+
+        with mock.patch.object(
+            signal_module,
+            "calculate_anticipatory_score",
+            return_value=(50, "bullish", ["Bullish structure break"]),
+        ):
+            prediction = signal_module.compute_prediction(frame, app_module.DEFAULT_PARAMS)
+
+        self.assertEqual(prediction["actionState"], "LONG_ACTIVE")
+        self.assertEqual(prediction["verdict"], "Bullish")
+        self.assertEqual(prediction["tradeabilityLabel"], "Medium")
+
+    def test_wait_prediction_does_not_carry_stale_rr_ratio(self):
+        frame = self.build_signal_frame()
+
+        with mock.patch.object(
+            signal_module,
+            "calculate_anticipatory_score",
+            return_value=(35, "neutral", []),
+        ):
+            prediction = signal_module.compute_prediction(frame, app_module.DEFAULT_PARAMS)
+
+        self.assertEqual(prediction["actionState"], "WAIT")
+        self.assertIsNone(prediction["rrRatio"])
+
+        raw_prediction = self.active_prediction("LONG_ACTIVE", score=25)
+        raw_prediction["rrRatio"] = 2
+        dashboard_prediction = app_module._apply_authoritative_signal_state(raw_prediction)
+        validated_prediction = app_module._ensure_validated_signal_prediction(raw_prediction)
+
+        self.assertEqual(dashboard_prediction["actionState"], "WAIT")
+        self.assertIsNone(dashboard_prediction["rrRatio"])
+        self.assertEqual(validated_prediction["actionState"], "WAIT")
+        self.assertIsNone(validated_prediction["rrRatio"])
 
     def test_signal_engine_flips_long_to_wait_immediately(self):
         frame = self.build_signal_frame()
