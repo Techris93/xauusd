@@ -3,6 +3,7 @@
 
 import atexit
 import base64
+import hashlib
 import json
 import logging
 import math
@@ -123,6 +124,14 @@ WEB_PUSH_SIGNAL_SNAPSHOT_PATH = _runtime_path(
     "WEB_PUSH_SIGNAL_SNAPSHOT_PATH",
     "runtime_webpush_signal_snapshot.json",
 )
+WEB_PUSH_NOTIFICATION_EVENTS_PATH = _runtime_path(
+    "WEB_PUSH_NOTIFICATION_EVENTS_PATH",
+    "runtime_webpush_notification_events.json",
+)
+NOTIFICATION_EVENT_TTL_SECONDS = _read_positive_int_env(
+    "NOTIFICATION_EVENT_TTL_SECONDS",
+    24 * 60 * 60,
+)
 MAX_NOTIFICATION_PAYLOAD_BYTES = 64 * 1024
 MAX_PUSH_ENDPOINT_BYTES = 2048
 MAX_PUSH_KEY_BYTES = 512
@@ -186,6 +195,7 @@ risk_state = _empty_risk_state()
 bar_state = {}
 prediction_refresh_lock = threading.RLock()
 push_lock = threading.Lock()
+notification_event_lock = threading.Lock()
 snapshot_state_lock = threading.Lock()
 risk_lock = threading.RLock()
 
@@ -362,11 +372,29 @@ def _load_push_subscriptions():
     payload = _read_json_file(WEB_PUSH_SUBSCRIPTIONS_PATH, default=[])
     if not isinstance(payload, list):
         return []
-    return [subscription for subscription in payload if isinstance(subscription, dict) and subscription.get("endpoint")]
+    subscriptions = []
+    seen_endpoints = set()
+    for subscription in payload:
+        if not isinstance(subscription, dict) or not subscription.get("endpoint"):
+            continue
+        endpoint = subscription.get("endpoint")
+        if endpoint in seen_endpoints:
+            logger.info(
+                "Ignoring duplicate stored push subscription endpoint_hash=%s",
+                _push_endpoint_hash(endpoint),
+            )
+            continue
+        seen_endpoints.add(endpoint)
+        subscriptions.append(subscription)
+    return subscriptions
 
 
 def _save_push_subscriptions(subscriptions):
     _write_json_file(WEB_PUSH_SUBSCRIPTIONS_PATH, subscriptions, mode=0o600)
+
+
+def _push_endpoint_hash(endpoint):
+    return hashlib.sha256(str(endpoint or "").encode("utf-8")).hexdigest()[:16]
 
 
 def _sanitize_push_client_id(client_id):
@@ -1319,6 +1347,7 @@ def _build_server_signal_snapshot(prediction):
     score = _finite_float(validation.get("score")) or _prediction_score(normalized)
 
     return {
+        "symbol": normalized.get("symbol") or DEFAULT_SYMBOL,
         "verdict": validation.get("verdict") or normalized.get("verdict") or "Neutral",
         "action": validation.get("action") or normalized.get("action") or "hold",
         "actionState": validation.get("actionState") or normalized.get("actionState") or "WAIT",
@@ -1335,6 +1364,7 @@ def _build_server_signal_snapshot(prediction):
         "suppressionReasons": list(validation.get("suppressionReasons") or []),
         "displayStatus": validation.get("displayStatus") or "Waiting for Signal",
         "dataStatus": validation.get("dataStatus") or "active",
+        "signalPrice": validation.get("signalPrice") or normalized.get("entryPrice"),
         "memoryActive": bool(validation.get("memoryActive", normalized.get("memoryActive", False))),
         "memoryReason": validation.get("memoryReason") or normalized.get("memoryReason"),
         "barsHeld": validation.get("barsHeld") or normalized.get("barsHeld"),
@@ -1481,6 +1511,7 @@ def _describe_server_signal_change(previous_snapshot, current_snapshot):
         "title": _build_server_alert_title(previous_snapshot, current_snapshot),
         "body": " | ".join(changes),
         "severity": severity,
+        "event": _build_notification_event(previous_snapshot, current_snapshot),
     }
 
 
@@ -1516,6 +1547,171 @@ def _set_notification_snapshot(snapshot):
     _save_last_notification_snapshot(last_notification_snapshot)
 
 
+def _notification_direction(snapshot):
+    action_state = (snapshot or {}).get("actionState")
+    if action_state == "LONG_ACTIVE":
+        return "LONG"
+    if action_state == "SHORT_ACTIVE":
+        return "SHORT"
+    verdict = str((snapshot or {}).get("verdict") or "").strip().lower()
+    if verdict == "bullish":
+        return "LONG"
+    if verdict == "bearish":
+        return "SHORT"
+    return "NEUTRAL"
+
+
+def _notification_event_type(previous_snapshot, current_snapshot):
+    previous_state = (previous_snapshot or {}).get("actionState")
+    current_state = (current_snapshot or {}).get("actionState")
+    if (current_snapshot or {}).get("exitReason"):
+        return "EXIT"
+    if previous_state in ACTIVE_ACTION_STATES and current_state in ACTIVE_ACTION_STATES and previous_state != current_state:
+        return "FLIP"
+    if current_state in ACTIVE_ACTION_STATES:
+        return "ENTER"
+    if previous_state in ACTIVE_ACTION_STATES and current_state == "WAIT":
+        return "PAUSE"
+    return "UPDATE"
+
+
+def _notification_time_bucket(value, bucket_seconds=300):
+    try:
+        timestamp = _coerce_utc_datetime(value)
+    except Exception:
+        return None
+    bucket_start = int(timestamp.timestamp() // bucket_seconds * bucket_seconds)
+    return datetime.fromtimestamp(bucket_start, tz=timezone.utc).isoformat()
+
+
+def _notification_event_anchor(snapshot):
+    snapshot = snapshot or {}
+    return (
+        snapshot.get("signalSnapshotId")
+        or snapshot.get("candleUsedForSignal")
+        or snapshot.get("lastClosedCandleTime")
+        or _notification_time_bucket(snapshot.get("timestamp"))
+        or "unknown"
+    )
+
+
+def _notification_lead_signal(snapshot):
+    signals = (snapshot or {}).get("signals")
+    if isinstance(signals, list) and signals:
+        return _normalize_signal_text(signals[0]).lower()
+    signals_key = str((snapshot or {}).get("signalsKey") or "").strip()
+    if signals_key:
+        return _normalize_signal_text(signals_key.split("|", 1)[0]).lower()
+    return ""
+
+
+def _build_notification_event(previous_snapshot, current_snapshot, generated_by="signal_transition"):
+    if not isinstance(current_snapshot, dict):
+        return None
+    event_type = _notification_event_type(previous_snapshot, current_snapshot)
+    canonical = {
+        "symbol": current_snapshot.get("symbol") or DEFAULT_SYMBOL,
+        "event_type": event_type,
+        "final_snapshot_anchor": _notification_event_anchor(current_snapshot),
+        "final_state": current_snapshot.get("actionState") or "WAIT",
+        "final_direction": _notification_direction(current_snapshot),
+        "final_action": current_snapshot.get("action") or "hold",
+        "exit_reason": current_snapshot.get("exitReason") or "",
+        "lead_signal": _notification_lead_signal(current_snapshot),
+        "candle_time": current_snapshot.get("candleUsedForSignal")
+        or current_snapshot.get("lastClosedCandleTime")
+        or "",
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()[:32]
+    event_id = f"xauusd-{event_type.lower()}-{digest}"
+    return {
+        "id": event_id,
+        "canonical": canonical,
+        "generatedBy": generated_by,
+        "eventType": event_type,
+        "symbol": canonical["symbol"],
+        "finalSnapshotId": current_snapshot.get("signalSnapshotId"),
+        "finalState": canonical["final_state"],
+        "finalDirection": canonical["final_direction"],
+        "finalScore": current_snapshot.get("score"),
+        "leadSignal": canonical["lead_signal"],
+    }
+
+
+def _load_notification_event_state(now=None):
+    now = _coerce_utc_datetime(now or datetime.now(timezone.utc))
+    payload = _read_json_file(WEB_PUSH_NOTIFICATION_EVENTS_PATH, default={})
+    events = payload.get("events") if isinstance(payload, dict) else {}
+    if not isinstance(events, dict):
+        events = {}
+    pruned_events = {}
+    for event_id, record in events.items():
+        if not isinstance(record, dict):
+            continue
+        expires_at = record.get("expiresAt")
+        try:
+            expires_at_dt = _coerce_utc_datetime(expires_at)
+        except Exception:
+            continue
+        if expires_at_dt > now:
+            pruned_events[event_id] = record
+    return {"events": pruned_events}
+
+
+def _save_notification_event_state(state):
+    _write_json_file(WEB_PUSH_NOTIFICATION_EVENTS_PATH, _json_safe(state), mode=0o600)
+
+
+def _claim_notification_event(notification_event, now=None):
+    if not isinstance(notification_event, dict) or not notification_event.get("id"):
+        return True
+    now = _coerce_utc_datetime(now or datetime.now(timezone.utc))
+    event_id = notification_event["id"]
+    with notification_event_lock:
+        state = _load_notification_event_state(now=now)
+        events = state.setdefault("events", {})
+        if event_id in events:
+            logger.info(
+                "Notification event skipped notification_event_id=%s symbol=%s event_type=%s "
+                "final_snapshot_id=%s final_state=%s final_direction=%s final_score=%s "
+                "lead_signal=%s generated_by=%s send_path=backend_push dedupe_result=skipped "
+                "skip_reason=already_sent",
+                event_id,
+                notification_event.get("symbol"),
+                notification_event.get("eventType"),
+                notification_event.get("finalSnapshotId"),
+                notification_event.get("finalState"),
+                notification_event.get("finalDirection"),
+                notification_event.get("finalScore"),
+                notification_event.get("leadSignal"),
+                notification_event.get("generatedBy"),
+            )
+            return False
+        expires_at = now + timedelta(seconds=NOTIFICATION_EVENT_TTL_SECONDS)
+        events[event_id] = {
+            "sentAt": now.isoformat(),
+            "expiresAt": expires_at.isoformat(),
+            "event": notification_event,
+        }
+        _save_notification_event_state(state)
+        logger.info(
+            "Notification event claimed notification_event_id=%s symbol=%s event_type=%s "
+            "final_snapshot_id=%s final_state=%s final_direction=%s final_score=%s "
+            "lead_signal=%s generated_by=%s send_path=backend_push dedupe_result=sent",
+            event_id,
+            notification_event.get("symbol"),
+            notification_event.get("eventType"),
+            notification_event.get("finalSnapshotId"),
+            notification_event.get("finalState"),
+            notification_event.get("finalDirection"),
+            notification_event.get("finalScore"),
+            notification_event.get("leadSignal"),
+            notification_event.get("generatedBy"),
+        )
+        return True
+
+
 def _web_push_error_text(exc):
     response = getattr(exc, "response", None)
     if response is None:
@@ -1546,7 +1742,7 @@ def _is_stale_push_failure(exc):
     return "badjwttoken" in normalized_text
 
 
-def _send_web_push_notification(title, body, severity):
+def _send_web_push_notification(title, body, severity, notification_event=None):
     subscriptions = _load_push_subscriptions()
     if not subscriptions:
         return
@@ -1555,24 +1751,48 @@ def _send_web_push_notification(title, body, severity):
     if not config.get("available") or webpush is None:
         return
 
+    event_id = notification_event.get("id") if isinstance(notification_event, dict) else None
+    event_type = notification_event.get("eventType") if isinstance(notification_event, dict) else None
+    notification_tag = event_id or "xauusd-important-signal"
     payload = json.dumps(
         {
             "version": SIGNAL_PUSH_PAYLOAD_VERSION,
+            "pushType": "signal",
             "createdAt": datetime.now(timezone.utc).isoformat(),
             "maxAgeSeconds": SIGNAL_PUSH_MAX_AGE_SECONDS,
             "title": title,
             "body": body,
-            "dedupeKey": f"{title}|{body}",
+            "notificationEventId": event_id,
+            "notification_event_id": event_id,
+            "eventType": event_type,
+            "signalSnapshotId": notification_event.get("finalSnapshotId") if isinstance(notification_event, dict) else None,
+            "dedupeKey": event_id or f"{title}|{body}",
             "url": "/",
-            "tag": "xauusd-important-signal",
+            "tag": notification_tag,
             "requireInteraction": severity in {"success", "error"},
         }
     )
     stale_endpoints = []
+    sent_endpoints = set()
 
     for subscription in subscriptions:
         endpoint = subscription.get("endpoint")
+        endpoint_hash = _push_endpoint_hash(endpoint)
+        if endpoint in sent_endpoints:
+            logger.info(
+                "Skipping duplicate push endpoint notification_event_id=%s endpoint_hash=%s",
+                event_id,
+                endpoint_hash,
+            )
+            continue
+        sent_endpoints.add(endpoint)
         try:
+            logger.info(
+                "Sending push notification_event_id=%s event_type=%s endpoint_hash=%s send_path=backend_push",
+                event_id,
+                event_type,
+                endpoint_hash,
+            )
             webpush(
                 subscription_info=subscription,
                 data=payload,
@@ -1581,11 +1801,11 @@ def _send_web_push_notification(title, body, severity):
                 ttl=300,
             )
         except WebPushException as exc:
-            logger.warning("Web push failed for %s: %s", endpoint, exc)
+            logger.warning("Web push failed for endpoint_hash=%s: %s", endpoint_hash, exc)
             if _is_stale_push_failure(exc):
                 stale_endpoints.append(endpoint)
         except Exception as exc:
-            logger.warning("Unexpected web push failure for %s: %s", endpoint, exc)
+            logger.warning("Unexpected web push failure for endpoint_hash=%s: %s", endpoint_hash, exc)
 
     for endpoint in stale_endpoints:
         _remove_push_subscription(endpoint)
@@ -1841,6 +2061,7 @@ def _risk_exit_notification(reason, active_signal, current_price):
 def _set_wait_after_risk_exit(active_signal, current_price, reason, timestamp):
     symbol = DEFAULT_SYMBOL
     reason_text = "Stop loss hit" if reason == "SL_HIT" else "Take profit hit"
+    exit_reason = "STOP_LOSS_HIT" if reason == "SL_HIT" else "TAKE_PROFIT_HIT"
     timestamp_iso = timestamp.isoformat()
     base_prediction = dict(latest_prediction) if isinstance(latest_prediction, dict) else {}
     base_prediction.update(
@@ -1861,6 +2082,7 @@ def _set_wait_after_risk_exit(active_signal, current_price, reason, timestamp):
             "dataSource": "Twelve Data",
             "symbol": symbol,
             "reason": reason_text,
+            "exitReason": exit_reason,
             "forecast": {
                 **(base_prediction.get("forecast") if isinstance(base_prediction.get("forecast"), dict) else {}),
                 "score": 0,
@@ -1868,7 +2090,12 @@ def _set_wait_after_risk_exit(active_signal, current_price, reason, timestamp):
             },
         }
     )
-    return _apply_authoritative_signal_state(base_prediction, status="active")
+    return _ensure_validated_signal_prediction(
+        base_prediction,
+        status="active",
+        now=timestamp,
+        advance=False,
+    )
 
 
 def _commit_risk_exit(active_signal, current_price, reason, timestamp, notify=True):
@@ -1878,6 +2105,7 @@ def _commit_risk_exit(active_signal, current_price, reason, timestamp, notify=Tr
     if active_signal is None or current_price is None:
         return False
 
+    previous_snapshot = _previous_notification_snapshot()
     with risk_lock:
         if active_trade_state is None:
             return False
@@ -1925,8 +2153,14 @@ def _commit_risk_exit(active_signal, current_price, reason, timestamp, notify=Tr
         _set_notification_snapshot(last_push_snapshot)
 
     title, body, severity = _risk_exit_notification(reason, closed_active_signal, current_price)
+    notification_event = _build_notification_event(
+        previous_snapshot,
+        last_push_snapshot,
+        generated_by="risk_engine",
+    )
     logger.info(
-        "Risk exit committed symbol=%s direction=%s reason=%s price=%s sl=%s tp=%s notification=%s",
+        "Risk exit committed symbol=%s direction=%s reason=%s price=%s sl=%s tp=%s "
+        "notification=%s notification_event_id=%s",
         DEFAULT_SYMBOL,
         closed_active_signal.get("direction"),
         reason,
@@ -1934,9 +2168,10 @@ def _commit_risk_exit(active_signal, current_price, reason, timestamp, notify=Tr
         closed_active_signal.get("stopLoss"),
         closed_active_signal.get("takeProfit"),
         "sent" if notify else "suppressed",
+        notification_event.get("id") if notification_event else None,
     )
-    if notify:
-        _send_web_push_notification(title, body, severity)
+    if notify and _claim_notification_event(notification_event):
+        _send_web_push_notification(title, body, severity, notification_event=notification_event)
     return True
 
 
@@ -2028,8 +2263,22 @@ def _notify_signal_change(prediction):
         )
         return
     _set_notification_snapshot(current_snapshot)
+    notification_event = change.get("event")
+    if not _claim_notification_event(notification_event):
+        _log_signal_transition(
+            previous_snapshot,
+            current_snapshot,
+            "suppressed",
+            "duplicate canonical notification event",
+        )
+        return
     _log_signal_transition(previous_snapshot, current_snapshot, "sent", "push-worthy transition")
-    _send_web_push_notification(change["title"], change["body"], change["severity"])
+    _send_web_push_notification(
+        change["title"],
+        change["body"],
+        change["severity"],
+        notification_event=notification_event,
+    )
 
 
 def _prediction_is_stale(max_staleness=MAX_PREDICTION_STALENESS):

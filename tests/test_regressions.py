@@ -42,6 +42,7 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.bar_state = {}
         app_module.get_web_push_config.cache_clear()
         Path(app_module.WEB_PUSH_SIGNAL_SNAPSHOT_PATH).unlink(missing_ok=True)
+        Path(app_module.WEB_PUSH_NOTIFICATION_EVENTS_PATH).unlink(missing_ok=True)
         self.timestamp_base = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=120)
         self.client = app_module.app.test_client()
 
@@ -58,6 +59,7 @@ class PredictorRegressionTests(unittest.TestCase):
         app_module.bar_state = {}
         app_module.get_web_push_config.cache_clear()
         Path(app_module.WEB_PUSH_SIGNAL_SNAPSHOT_PATH).unlink(missing_ok=True)
+        Path(app_module.WEB_PUSH_NOTIFICATION_EVENTS_PATH).unlink(missing_ok=True)
 
     @staticmethod
     def build_frame(index=None, volume=1000.0):
@@ -1422,6 +1424,10 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertIn("Ignoring stale signal push payload", response_body)
         self.assertIn("Ignoring expired signal push payload", response_body)
         self.assertIn("Ignoring duplicate signal push payload", response_body)
+        self.assertIn("Ignoring duplicate signal event payload", response_body)
+        self.assertIn("notificationEventId", response_body)
+        self.assertIn("recentSignalEventIds", response_body)
+        self.assertIn("renotify: false", response_body)
         self.assertIn('self.clients.matchAll', response_body)
         self.assertIn('type: "xauusd.signalPush"', response_body)
         self.assertIn("client.postMessage", response_body)
@@ -1433,6 +1439,9 @@ class PredictorRegressionTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("showToast(`${change.title}", response_body)
+        self.assertNotIn("new Notification", response_body)
+        self.assertNotIn("describeImportantChange", response_body)
+        self.assertNotIn("buildAlertTitle", response_body)
 
     def test_dashboard_removes_bar_grace_status_band(self):
         response = self.client.get("/")
@@ -1554,6 +1563,182 @@ class PredictorRegressionTests(unittest.TestCase):
             app_module._notify_signal_change(prediction(["Bullish continuation"], 95, confidence=96))
 
         self.assertEqual(mocked_push.call_count, 1)
+
+    def test_exact_duplicate_exit_notification_event_sends_once(self):
+        previous_prediction = app_module._ensure_validated_signal_prediction(
+            self.active_prediction_for_closed_candle(
+                "SHORT_ACTIVE",
+                score=72,
+                timestamp_offset=1,
+                candle_offset=0,
+                snapshot_suffix="short-entry-before-exit",
+            ),
+            now=datetime.fromisoformat(self.iso_at(1)),
+            advance=False,
+        )
+        previous_snapshot = app_module._build_server_signal_snapshot(previous_prediction)
+        exit_timestamp = self.iso_at(120)
+        exit_prediction = self.wait_prediction(
+            score=25,
+            blockers=["WEAK_CONTINUATION"],
+            timestamp=exit_timestamp,
+            candle_timestamp=self.iso_at(60),
+        )
+        exit_prediction.update(
+            {
+                "exitReason": "WEAK_CONTINUATION",
+                "signals": ["Signal memory exit: Weak Continuation"],
+                "signal_snapshot_id": "short-exit-weak-continuation",
+                "calculation_time": exit_timestamp,
+                "candle_used_for_signal": self.iso_at(60),
+                "last_closed_candle_time": self.iso_at(60),
+                "signalValidation": {
+                    "validated": True,
+                    "actionState": "WAIT",
+                    "action": "hold",
+                    "verdict": "Neutral",
+                    "tradeabilityLabel": "Low",
+                    "score": 25.0,
+                    "threshold": 45.0,
+                    "blockers": ["WEAK_CONTINUATION"],
+                    "activeTrade": False,
+                    "displayStatus": "Waiting for Signal",
+                    "notificationAllowed": True,
+                    "suppressionReasons": [],
+                    "dataStatus": "active",
+                    "exitReason": "WEAK_CONTINUATION",
+                    "signalSnapshotId": "short-exit-weak-continuation",
+                    "calculationTime": exit_timestamp,
+                    "candleUsedForSignal": self.iso_at(60),
+                    "lastClosedCandleTime": self.iso_at(60),
+                },
+            }
+        )
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module.last_notification_snapshot = previous_snapshot
+            app_module._notify_signal_change(exit_prediction)
+            first_event = mocked_push.call_args.kwargs["notification_event"]
+            app_module.last_notification_snapshot = previous_snapshot
+            app_module._notify_signal_change(exit_prediction)
+
+        self.assertEqual(mocked_push.call_count, 1)
+        self.assertEqual(first_event["eventType"], "EXIT")
+        self.assertEqual(first_event["id"], app_module._build_notification_event(
+            previous_snapshot,
+            app_module._build_server_signal_snapshot(exit_prediction),
+        )["id"])
+
+    def test_near_duplicate_short_enter_uses_same_event_id_and_sends_once(self):
+        first_previous = self.wait_snapshot(score=25, has_blockers=True)
+        second_previous = self.wait_snapshot(score=42, has_blockers=True)
+        second_previous["confidence"] = 72.0
+        final_prediction = self.active_prediction_for_closed_candle(
+            "SHORT_ACTIVE",
+            score=53,
+            timestamp_offset=60,
+            candle_offset=0,
+            snapshot_suffix="canonical-short-enter",
+        )
+        final_prediction["confidence"] = 87
+        final_prediction["tradeabilityLabel"] = "Medium"
+        final_prediction["signals"] = ["VWAP bearish rejection (strength: 0.90)"]
+        final_prediction = app_module._ensure_validated_signal_prediction(
+            final_prediction,
+            now=datetime.fromisoformat(self.iso_at(60)),
+            advance=False,
+        )
+        final_snapshot = app_module._build_server_signal_snapshot(final_prediction)
+
+        first_event = app_module._build_notification_event(first_previous, final_snapshot)
+        second_event = app_module._build_notification_event(second_previous, final_snapshot)
+        self.assertEqual(first_event["id"], second_event["id"])
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module.last_notification_snapshot = first_previous
+            app_module._notify_signal_change(final_prediction)
+            app_module.last_notification_snapshot = second_previous
+            app_module._notify_signal_change(final_prediction)
+
+        self.assertEqual(mocked_push.call_count, 1)
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD short signal active")
+        self.assertEqual(mocked_push.call_args.kwargs["notification_event"]["id"], first_event["id"])
+
+    def test_near_duplicate_long_enter_uses_same_event_id_and_sends_once(self):
+        first_previous = self.wait_snapshot(score=25, has_blockers=True)
+        second_previous = self.wait_snapshot(score=42, has_blockers=True)
+        final_prediction = self.active_prediction_for_closed_candle(
+            "LONG_ACTIVE",
+            score=53,
+            timestamp_offset=60,
+            candle_offset=0,
+            snapshot_suffix="canonical-long-enter",
+        )
+        final_prediction["confidence"] = 87
+        final_prediction["tradeabilityLabel"] = "Medium"
+        final_prediction["signals"] = ["VWAP bullish rejection (strength: 0.90)"]
+        final_prediction = app_module._ensure_validated_signal_prediction(
+            final_prediction,
+            now=datetime.fromisoformat(self.iso_at(60)),
+            advance=False,
+        )
+        final_snapshot = app_module._build_server_signal_snapshot(final_prediction)
+
+        first_event = app_module._build_notification_event(first_previous, final_snapshot)
+        second_event = app_module._build_notification_event(second_previous, final_snapshot)
+        self.assertEqual(first_event["id"], second_event["id"])
+
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module.last_notification_snapshot = first_previous
+            app_module._notify_signal_change(final_prediction)
+            app_module.last_notification_snapshot = second_previous
+            app_module._notify_signal_change(final_prediction)
+
+        self.assertEqual(mocked_push.call_count, 1)
+        self.assertEqual(mocked_push.call_args.args[0], "XAU/USD long signal active")
+        self.assertEqual(mocked_push.call_args.kwargs["notification_event"]["id"], first_event["id"])
+
+    def test_legitimate_later_same_transition_gets_new_event_id(self):
+        previous = self.wait_snapshot(score=25, has_blockers=True)
+        first_prediction = app_module._ensure_validated_signal_prediction(
+            self.active_prediction_for_closed_candle(
+                "SHORT_ACTIVE",
+                score=53,
+                timestamp_offset=60,
+                candle_offset=0,
+                snapshot_suffix="first-short-enter",
+            ),
+            now=datetime.fromisoformat(self.iso_at(60)),
+            advance=False,
+        )
+        second_prediction = app_module._ensure_validated_signal_prediction(
+            self.active_prediction_for_closed_candle(
+                "SHORT_ACTIVE",
+                score=55,
+                timestamp_offset=3660,
+                candle_offset=3600,
+                snapshot_suffix="later-short-enter",
+            ),
+            now=datetime.fromisoformat(self.iso_at(3660)),
+            advance=False,
+        )
+        first_event = app_module._build_notification_event(
+            previous,
+            app_module._build_server_signal_snapshot(first_prediction),
+        )
+        second_event = app_module._build_notification_event(
+            previous,
+            app_module._build_server_signal_snapshot(second_prediction),
+        )
+
+        self.assertNotEqual(first_event["id"], second_event["id"])
+        with mock.patch.object(app_module, "_send_web_push_notification") as mocked_push:
+            app_module.last_notification_snapshot = previous
+            app_module._notify_signal_change(first_prediction)
+            app_module.last_notification_snapshot = previous
+            app_module._notify_signal_change(second_prediction)
+
+        self.assertEqual(mocked_push.call_count, 2)
 
     def test_no_notification_cooldown_blocks_valid_exit_and_new_opposite_signal(self):
         app_module.last_push_snapshot = self.wait_snapshot(has_blockers=False)
@@ -2290,7 +2475,92 @@ class PredictorRegressionTests(unittest.TestCase):
         self.assertEqual(payload["version"], app_module.SIGNAL_PUSH_PAYLOAD_VERSION)
         self.assertEqual(payload["maxAgeSeconds"], app_module.SIGNAL_PUSH_MAX_AGE_SECONDS)
         self.assertEqual(payload["dedupeKey"], "title|body")
+        self.assertEqual(payload["pushType"], "signal")
+        self.assertIsNone(payload["notificationEventId"])
         self.assertIsNotNone(datetime.fromisoformat(payload["createdAt"]))
+
+    def test_web_push_payload_uses_canonical_event_id_for_tag_and_dedupe(self):
+        sample_subscription = {
+            "endpoint": "https://example.com/subscriptions/device-1",
+            "expirationTime": None,
+            "keys": {
+                "p256dh": "sample-p256dh-key",
+                "auth": "sample-auth-key",
+            },
+        }
+        notification_event = {
+            "id": "xauusd-enter-canonical",
+            "eventType": "ENTER",
+            "symbol": "XAU/USD",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            subscriptions_path = str(Path(temp_dir) / "push_subscriptions.json")
+            push_config = {
+                "available": True,
+                "workerPath": "/notification-sw.js",
+                "vapidPublicKey": "sample-public-key",
+                "subject": "mailto:test@example.com",
+                "privateKeyPath": str(Path(temp_dir) / "test-private.pem"),
+            }
+            with mock.patch.object(app_module, "WEB_PUSH_SUBSCRIPTIONS_PATH", subscriptions_path):
+                app_module._save_push_subscriptions([sample_subscription])
+                with mock.patch.object(app_module, "get_web_push_config", return_value=push_config):
+                    with mock.patch.object(app_module, "webpush") as mocked_webpush:
+                        app_module._send_web_push_notification(
+                            "title",
+                            "body",
+                            "success",
+                            notification_event=notification_event,
+                        )
+
+        payload = json.loads(mocked_webpush.call_args.kwargs["data"])
+        self.assertEqual(payload["notificationEventId"], "xauusd-enter-canonical")
+        self.assertEqual(payload["notification_event_id"], "xauusd-enter-canonical")
+        self.assertEqual(payload["dedupeKey"], "xauusd-enter-canonical")
+        self.assertEqual(payload["tag"], "xauusd-enter-canonical")
+        self.assertEqual(payload["eventType"], "ENTER")
+
+    def test_duplicate_subscriptions_with_same_endpoint_send_once_per_event(self):
+        sample_subscription = {
+            "endpoint": "https://example.com/subscriptions/device-1",
+            "expirationTime": None,
+            "keys": {
+                "p256dh": "sample-p256dh-key",
+                "auth": "sample-auth-key",
+            },
+        }
+        duplicate_subscription = {
+            **sample_subscription,
+            "keys": dict(sample_subscription["keys"]),
+        }
+        notification_event = {
+            "id": "xauusd-enter-deduped-endpoint",
+            "eventType": "ENTER",
+            "symbol": "XAU/USD",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            subscriptions_path = str(Path(temp_dir) / "push_subscriptions.json")
+            push_config = {
+                "available": True,
+                "workerPath": "/notification-sw.js",
+                "vapidPublicKey": "sample-public-key",
+                "subject": "mailto:test@example.com",
+                "privateKeyPath": str(Path(temp_dir) / "test-private.pem"),
+            }
+            with mock.patch.object(app_module, "WEB_PUSH_SUBSCRIPTIONS_PATH", subscriptions_path):
+                app_module._save_push_subscriptions([sample_subscription, duplicate_subscription])
+                with mock.patch.object(app_module, "get_web_push_config", return_value=push_config):
+                    with mock.patch.object(app_module, "webpush") as mocked_webpush:
+                        app_module._send_web_push_notification(
+                            "title",
+                            "body",
+                            "success",
+                            notification_event=notification_event,
+                        )
+
+        mocked_webpush.assert_called_once()
 
     def test_notification_subscription_routes_roundtrip(self):
         sample_subscription = {

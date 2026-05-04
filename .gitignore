@@ -7,3 +7,4 @@ __pycache__/
 runtime_webpush_subscriptions.json
 runtime_webpush_vapid.json
 runtime_webpush_vapid_private.pem
+runtime_webpush_notification_events.json

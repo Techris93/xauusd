@@ -1,5 +1,6 @@
 self.SIGNAL_PUSH_PAYLOAD_VERSION = "authoritative-signal-v2";
 self.lastSignalPush = null;
+self.recentSignalEventIds = new Map();
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());
@@ -22,15 +23,22 @@ self.addEventListener("push", (event) => {
     }
   }
 
-  const tag = payload.tag || "xauusd-important-signal";
-  if (
-    tag === "xauusd-important-signal" &&
-    payload.version !== self.SIGNAL_PUSH_PAYLOAD_VERSION
-  ) {
+  const eventId =
+    payload.notificationEventId ||
+    payload.notification_event_id ||
+    payload.dedupeKey ||
+    null;
+  const tag = payload.tag || eventId || "xauusd-important-signal";
+  const isSignalPayload =
+    payload.pushType === "signal" ||
+    payload.version === self.SIGNAL_PUSH_PAYLOAD_VERSION ||
+    tag === "xauusd-important-signal" ||
+    String(tag).startsWith("xauusd-");
+  if (isSignalPayload && payload.version !== self.SIGNAL_PUSH_PAYLOAD_VERSION) {
     console.warn("Ignoring stale signal push payload.");
     return;
   }
-  if (tag === "xauusd-important-signal") {
+  if (isSignalPayload) {
     const createdAt = Date.parse(payload.createdAt || "");
     const maxAgeSeconds = Number.isFinite(Number(payload.maxAgeSeconds))
       ? Number(payload.maxAgeSeconds)
@@ -46,39 +54,53 @@ self.addEventListener("push", (event) => {
 
   const title = payload.title || "XAU/USD signal update";
   const body = payload.body || "Important signal conditions changed.";
-  if (tag === "xauusd-important-signal") {
-    const dedupeKey = payload.dedupeKey || `${title}|${body}`;
+  if (isSignalPayload) {
+    const dedupeKey = eventId || `${title}|${body}`;
     const lastPush = self.lastSignalPush;
     const duplicateWindowSeconds = Number.isFinite(Number(payload.maxAgeSeconds))
       ? Number(payload.maxAgeSeconds)
       : 300;
+    const now = Date.now();
+    for (const [storedEventId, storedAt] of self.recentSignalEventIds.entries()) {
+      if (now - storedAt > duplicateWindowSeconds * 1000) {
+        self.recentSignalEventIds.delete(storedEventId);
+      }
+    }
+    if (self.recentSignalEventIds.has(dedupeKey)) {
+      console.warn("Ignoring duplicate signal event payload.", {
+        notificationEventId: dedupeKey,
+      });
+      return;
+    }
     if (
       lastPush &&
       lastPush.key === dedupeKey &&
-      Date.now() - lastPush.time < duplicateWindowSeconds * 1000
+      now - lastPush.time < duplicateWindowSeconds * 1000
     ) {
       console.warn("Ignoring duplicate signal push payload.");
       return;
     }
+    self.recentSignalEventIds.set(dedupeKey, now);
     self.lastSignalPush = {
       key: dedupeKey,
-      time: Date.now(),
+      time: now,
     };
   }
 
   const options = {
     body: body,
     tag: tag,
-    renotify: true,
+    renotify: false,
     requireInteraction: Boolean(payload.requireInteraction),
     data: {
       url: payload.url || "/",
+      notificationEventId: eventId,
     },
   };
 
   event.waitUntil(
     (async () => {
-      if (tag === "xauusd-important-signal") {
+      if (isSignalPayload) {
         const clients = await self.clients.matchAll({
           type: "window",
           includeUncontrolled: true,
@@ -88,6 +110,7 @@ self.addEventListener("push", (event) => {
             type: "xauusd.signalPush",
             createdAt: payload.createdAt || null,
             snapshotId: payload.signalSnapshotId || null,
+            notificationEventId: eventId,
           });
         }
       }
